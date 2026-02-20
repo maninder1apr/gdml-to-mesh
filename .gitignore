@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Generated geometry
+meshes/**/*.npz
+meshes/**/*.bin
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+env_*/
+
+# macOS
+.DS_Store
+
+# Editor backups
+*~
+*.swp
+*.save
