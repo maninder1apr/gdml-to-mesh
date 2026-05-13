@@ -28,4 +28,3 @@ This project implements the following workflow:
 ---
 
 ## Repository Structure
-
