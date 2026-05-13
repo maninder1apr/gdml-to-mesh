@@ -32,12 +32,9 @@ find_package(ZLIB REQUIRED)
 # ============================================================
 
 include_directories(
-
     include
-
     ${Geant4_INCLUDE_DIRS}
-
-    ${OpenCASCADE_INCLUDE_DIR}
+    ${OpenCASCADE_INCLUDE_DIRS}
 )
 
 # ============================================================
@@ -45,17 +42,14 @@ include_directories(
 # ============================================================
 
 add_library(cnpy
-
     cnpy/cnpy.cpp
 )
 
 target_include_directories(cnpy PUBLIC
-
     ${CMAKE_CURRENT_LIST_DIR}/cnpy
 )
 
 target_link_libraries(cnpy PUBLIC
-
     ZLIB::ZLIB
 )
 
@@ -74,16 +68,12 @@ add_executable(occ_mesher
 )
 
 target_include_directories(occ_mesher PUBLIC
-
     include
 )
 
 target_link_libraries(occ_mesher
-
     cnpy
-
     ${Geant4_LIBRARIES}
-
     ${OpenCASCADE_LIBRARIES}
 )
 
@@ -92,15 +82,13 @@ target_link_libraries(occ_mesher
 # ============================================================
 
 add_executable(extract_mesh
-
     extract_mesh.cc
 )
 
 target_link_libraries(extract_mesh
-
     cnpy
-
     ${Geant4_LIBRARIES}
+    ${OpenCASCADE_LIBRARIES}       # optional (if mesh functions use OCC)
 )
 
 # ============================================================
@@ -108,29 +96,25 @@ target_link_libraries(extract_mesh
 # ============================================================
 
 add_executable(extract_placements
-
     extract_placements.cc
 )
 
 target_link_libraries(extract_placements
-
     cnpy
-
     ${Geant4_LIBRARIES}
+    ${OpenCASCADE_LIBRARIES}       # optional (only needed if OCC used)
 )
 
 # ============================================================
-# extract_surfaces
+# extract_surfaces (NEEDS OpenCascade)
 # ============================================================
 
 add_executable(extract_surfaces
-
     extract_surfaces.cc
 )
 
 target_link_libraries(extract_surfaces
-
     cnpy
-
     ${Geant4_LIBRARIES}
+    ${OpenCASCADE_LIBRARIES}
 )
