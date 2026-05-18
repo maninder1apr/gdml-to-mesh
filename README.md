@@ -13,13 +13,11 @@ A tool for converting GDML (Geometry Description Markup Language) files into mes
 
 ## Prerequisites
 
-1. **Python 3.x**  
+1. **Python 3.x**
    Install Python 3 from [python.org](https://www.python.org/downloads/).
 
-2. **Python Virtual Environment (Optional Recommended)**  
+2. **Python Virtual Environment (Optional Recommended)**
    Manage dependencies in an isolated environment.
 
-3. **Open CASCADE (OCC) / pythonOCC**  
+3. **Open CASCADE (OCC) / pythonOCC**
    Used for CAD geometry processing and boundary surface extraction.
-
-
