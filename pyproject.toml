@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gdml-to-mesh"
+version = "0.1.0"
+description = "Python wrapper for the LEGEND-Theia GDML-to-mesh geometry engine"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "trimesh",
+    "matplotlib",
+    "numpy",
+    "scipy",
+]
+
+[project.scripts]
+gdml-to-mesh = "gdml_to_mesh.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["gdml_to_mesh*"]
