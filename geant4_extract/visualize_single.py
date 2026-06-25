@@ -153,12 +153,12 @@ def render(interfaces, volumes_dir="cad/volumes", highlight_id=None):
 
         legend_patches.append(mpatches.Patch(
             facecolor=color, edgecolor="#ffffff44",
-            label=f"[{iface['id']}] {marker} {iface['lv_inside']} ({iface['surface']})"
+            label=f"[{iface['id']}] {marker} {iface['pv_inside']} ({iface['surface']})"
         ))
 
         # boundary check for highlighted or all
         if highlight_id is None or iface['id'] == highlight_id:
-            inside_stl = Path(volumes_dir) / f"{iface['lv_inside']}.stl"
+            inside_stl = Path(volumes_dir) / f"{iface['pv_inside']}.stl"
             if inside_stl.exists():
                 mesh_vol, _ = load_mesh(str(inside_stl), max_faces=99999)
                 if mesh_vol:
@@ -166,7 +166,7 @@ def render(interfaces, volumes_dir="cad/volumes", highlight_id=None):
                     if mx is not None:
                         status = "PASS" if mx < 0.15 else "FAIL"
                         val_lines.append(
-                            (f"[{iface['id']}] {iface['lv_inside']} boundary: "
+                            (f"[{iface['id']}] {iface['pv_inside']} boundary: "
                              f"max={mx:.4f}mm  mean={mn:.4f}mm  [{status}]",
                              "#2ECC71" if status == "PASS" else "#E74C3C")
                         )
@@ -231,7 +231,7 @@ def render(interfaces, volumes_dir="cad/volumes", highlight_id=None):
     if highlight_id is not None:
         iface = next(i for i in interfaces if i['id'] == highlight_id)
         marker = SURFACE_MARKER.get(iface['surface'], "?")
-        title = (f"Interface {highlight_id} {marker}  {iface['lv_inside']} | {iface['lv_outside']}"
+        title = (f"Interface {highlight_id} {marker}  {iface['pv_inside']} | {iface['pv_outside']}"
                  f"  —  {iface['surface'].upper()}  ·  {iface['n_triangles']:,} tris")
 
     plt.suptitle(title, color="#E8EDF2", fontsize=10, y=1.01)

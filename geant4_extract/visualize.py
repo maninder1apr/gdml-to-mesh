@@ -253,7 +253,7 @@ def main():
     parser.add_argument("--list",       action="store_true")
     parser.add_argument("--no-volumes", action="store_true")
     parser.add_argument("--surface",    default=None,
-                        choices=["blackbody", "specular", "detector"],
+                        choices=["blackbody", "specular", "detector", "default"],
                         help="Filter by surface type")
     parser.add_argument("--material",   default=None,
                         help="Filter by material_inside")

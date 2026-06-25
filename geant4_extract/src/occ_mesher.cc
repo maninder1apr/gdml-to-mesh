@@ -9,9 +9,16 @@
 #include "VolumeSTLExporter.hh"
 
 #include <G4GDMLParser.hh>
+#include <G4GDMLAuxStructType.hh>
+#include <G4GeometryTolerance.hh>
 #include <G4LogicalVolume.hh>
 #include <G4LogicalVolumeStore.hh>
+#include <G4SystemOfUnits.hh>
 #include <G4VSolid.hh>
+
+#include <algorithm>
+
+#include <map>
 
 #include <TopoDS_Shape.hxx>
 #include <TopoDS_Compound.hxx>
@@ -64,6 +71,35 @@ void OCCMesher::run(
     );
 
     fs::current_path(old_cwd);
+
+    // ------------------------------------------------------------
+    // read optical detector map from GDML <userinfo>
+    // <auxiliary auxtype="RMG_detector" auxvalue="optical">
+    //   <auxiliary auxtype="sipm_top_0" auxvalue="1000"/>
+    //   ...
+    // </auxiliary>
+    // ------------------------------------------------------------
+
+    std::map<std::string, int> optical_detectors;
+
+    const G4GDMLAuxListType* auxList = parser.GetAuxList();
+
+    if (auxList) {
+        for (const auto& aux : *auxList) {
+            if (aux.type == "RMG_detector" && aux.value == "optical") {
+                if (aux.auxList) {
+                    for (const auto& child : *aux.auxList)
+                        optical_detectors[child.type] =
+                            std::stoi(child.value);
+                }
+            }
+        }
+    }
+
+    std::cout
+        << "Optical detectors from GDML: "
+        << optical_detectors.size()
+        << std::endl;
 
     // ------------------------------------------------------------
     // create output directories
@@ -125,10 +161,24 @@ void OCCMesher::run(
     // extract touching interfaces
     // ------------------------------------------------------------
 
+    // Fuzzy tolerance for coincident-face detection between touching
+    // sibling volumes. Geant4's surface tolerance is world-extent
+    // relative and can be unrealistically small/large, so floor it at
+    // 0.1 µm
+    double surf_tol_mm =
+        G4GeometryTolerance::GetInstance()->GetSurfaceTolerance() / CLHEP::mm;
+
+    double fuzzy_mm = std::max(surf_tol_mm, 1e-4);
+
+    std::cout << "\nG4 surface tolerance = " << surf_tol_mm
+              << " mm; using fuzzy = " << fuzzy_mm << " mm\n";
+
     InterfaceExtractor extractor;
 
     extractor.Extract(
-        detector
+        detector,
+        optical_detectors,
+        fuzzy_mm
     );
 
     // ------------------------------------------------------------

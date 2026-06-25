@@ -26,7 +26,9 @@ private:
 
         const G4RotationMatrix& parent_rot,
 
-        const G4ThreeVector& parent_trans
+        const G4ThreeVector& parent_trans,
+
+        uint64_t parent_id
     );
 
 private:

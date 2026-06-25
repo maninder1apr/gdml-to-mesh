@@ -38,7 +38,7 @@ find_package(ZLIB REQUIRED)
 include_directories(
     include
     ${Geant4_INCLUDE_DIRS}
-    ${OpenCASCADE_INCLUDE_DIRS}
+    ${OpenCASCADE_INCLUDE_DIR}
 )
 
 # ============================================================

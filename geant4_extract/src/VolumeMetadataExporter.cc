@@ -16,14 +16,6 @@ void VolumeMetadataExporter::ExportVolumes(const DetectorAssembly& assembly, con
         volJson["id"] = vol.id;
         volJson["name"] = vol.name;
         volJson["material"] = vol.material;
-        volJson["parent_id"] = vol.parent_id;
-
-        // Assuming translation and rotation are std::vector<double>
-        volJson["translation"] = vol.translation;
-        volJson["rotation"] = vol.rotation;
-
-        // Add mesh filename if you have it, e.g.
-        // volJson["mesh_file"] = vol.mesh_file;
 
         j["volumes"].push_back(volJson);
     }

@@ -1,6 +1,7 @@
 name: gdml-to-mesh
 channels:
   - conda-forge
+  - DLR-SC
   - defaults
 dependencies:
   - python=3.11

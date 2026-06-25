@@ -81,7 +81,7 @@ def main():
 
     # visualize
     p_viz = sub.add_parser("visualize", help="Launch the geometry visualizer")
-    p_viz.add_argument("--surface", choices=["blackbody", "specular", "detector"], default=None)
+    p_viz.add_argument("--surface", choices=["blackbody", "specular", "detector", "default"], default=None)
     p_viz.add_argument("--no-volumes", action="store_true")
     p_viz.add_argument("--list", action="store_true")
 

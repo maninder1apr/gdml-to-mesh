@@ -3,6 +3,8 @@
 #include <G4VSolid.hh>
 
 #include <G4GenericPolycone.hh>
+#include <G4Orb.hh>
+#include <G4Sphere.hh>
 #include <G4UnionSolid.hh>
 #include <G4SubtractionSolid.hh>
 #include <G4DisplacedSolid.hh>

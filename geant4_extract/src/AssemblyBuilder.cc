@@ -68,7 +68,9 @@ DetectorAssembly AssemblyBuilder::Build(
 
         identity_rot,
 
-        identity_trans
+        identity_trans,
+
+        VolumeInstance::kNoMother
     );
 
     return assembly_;
@@ -84,7 +86,9 @@ void AssemblyBuilder::Traverse(
 
     const G4RotationMatrix& parent_rot,
 
-    const G4ThreeVector& parent_trans
+    const G4ThreeVector& parent_trans,
+
+    uint64_t parent_id
 ) {
 
     if (!pv)
@@ -95,6 +99,11 @@ void AssemblyBuilder::Traverse(
 
     if (!lv)
         return;
+
+    // id seen by this node's daughters as their mother. Defaults to the
+    // inherited parent id so that nodes which produce no VolumeInstance
+    // (the World, or any null-shape node) do not orphan their daughters.
+    uint64_t this_id = parent_id;
 
     // --------------------------------------------------------
     // local transform
@@ -223,8 +232,17 @@ void AssemblyBuilder::Traverse(
                 inst.id =
                     next_volume_id_++;
 
+                inst.mother_id =
+                    parent_id;
+
+                // this node's daughters border THIS node as their mother
+                this_id = inst.id;
+
                 inst.name =
                     pv->GetName();
+
+                inst.lv_name =
+                    lv->GetName();
 
                 if (lv->GetMaterial()) {
 
@@ -300,7 +318,9 @@ void AssemblyBuilder::Traverse(
 
             global_rot,
 
-            global_trans
+            global_trans,
+
+            this_id
         );
     }
 }

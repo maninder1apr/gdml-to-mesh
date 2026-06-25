@@ -22,4 +22,4 @@ gdml-to-mesh = "gdml_to_mesh.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["gdml_to_mesh*"]
+include = ["gdml_to_mesh*", "legend_theia*"]

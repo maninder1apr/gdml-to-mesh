@@ -159,6 +159,11 @@ void SurfaceExporter::Export(const std::string& outDir)
             entry["type"]    = "border";
             entry["g4_name"] = std::string(surf->GetName());
 
+            entry["pv_pair"] = {
+                std::string(vol1->GetName()),
+                std::string(vol2->GetName())
+            };
+
             entry["lv_pair"] = {
                 std::string(vol1->GetLogicalVolume()->GetName()),
                 std::string(vol2->GetLogicalVolume()->GetName())
