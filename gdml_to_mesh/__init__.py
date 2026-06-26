@@ -212,20 +212,7 @@ def _load_result(work_dir: Path) -> GeometryResult:
             label = (border.get((pv_in, pv_out))
                      or skin.get(lv_in)
                      or skin.get(lv_out))
-            if label is None:
-                # fall back to material-based heuristic for known absorbers
-                mat_in  = iface.get("material_inside", "")
-                mat_out = iface.get("material_outside", "")
-                blackbody_mats = {"EnrichedGermanium0.076", "NaturalGermanium", "metal_copper"}
-                specular_mats  = {"PEN", "tpb_on_fibers"}
-                both = {mat_in, mat_out}
-                if both & blackbody_mats:
-                    label = "blackbody"
-                elif both & specular_mats:
-                    label = "specular"
-                else:
-                    label = "default"
-            iface["surface"] = label
+            iface["surface"] = label if label is not None else "default"
 
     return GeometryResult(
         output_dir=work_dir,
