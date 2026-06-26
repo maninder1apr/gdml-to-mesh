@@ -10,6 +10,8 @@
 #include <G4SystemOfUnits.hh>
 #include <G4ThreeVector.hh>
 #include <G4VPhysicalVolume.hh>
+#include <G4LogicalVolumeStore.hh>
+#include <G4LogicalVolumeStore.hh>
 #include <G4VSolid.hh>
 
 #include <BRep_Builder.hxx>
@@ -33,12 +35,15 @@ AssemblyBuilder::AssemblyBuilder() {}
 // ============================================================
 
 DetectorAssembly AssemblyBuilder::Build(
-    G4VPhysicalVolume* world
+    G4VPhysicalVolume* world,
+    const std::map<std::string, std::string>& pv_to_lv
 ) {
 
     // reset assembly
 
     assembly_ = DetectorAssembly();
+
+    pv_to_lv_ = pv_to_lv;
 
     BRep_Builder builder;
 
@@ -241,8 +246,18 @@ void AssemblyBuilder::Traverse(
                 inst.name =
                     pv->GetName();
 
-                inst.lv_name =
-                    lv->GetName();
+                // Use the GDML <volume name=...> via the store,
+                // since the GDML parser renames LVs to match physvol names.
+                {
+                    auto* store = G4LogicalVolumeStore::GetInstance();
+                    inst.lv_name = lv->GetName(); // fallback
+                    for (auto* slv : *store) {
+                        if (slv == lv) {
+                            inst.lv_name = slv->GetName();
+                            break;
+                        }
+                    }
+                }
 
                 if (lv->GetMaterial()) {
 

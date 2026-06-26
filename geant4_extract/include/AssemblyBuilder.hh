@@ -7,6 +7,8 @@
 #include <G4VPhysicalVolume.hh>
 
 #include <cstdint>
+#include <map>
+#include <string>
 
 class AssemblyBuilder {
 
@@ -15,7 +17,8 @@ public:
     AssemblyBuilder();
 
     DetectorAssembly Build(
-        G4VPhysicalVolume* world
+        G4VPhysicalVolume* world,
+        const std::map<std::string, std::string>& pv_to_lv = {}
     );
 
 private:
@@ -36,4 +39,6 @@ private:
     DetectorAssembly assembly_;
 
     uint64_t next_volume_id_ = 0;
+
+    std::map<std::string, std::string> pv_to_lv_;
 };

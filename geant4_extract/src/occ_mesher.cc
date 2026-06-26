@@ -27,6 +27,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <fstream>
 
 namespace fs = std::filesystem;
 
@@ -143,11 +144,44 @@ void OCCMesher::run(
         return;
     }
 
+
+    // ------------------------------------------------------------
+    // build PV name -> LV name map from GDML XML
+    // ------------------------------------------------------------
+    std::map<std::string, std::string> pv_to_lv;
+    {
+        std::ifstream gdml_stream(gdml_path.string());
+        std::string line;
+        std::string current_lv;
+        while (std::getline(gdml_stream, line)) {
+            // match <volume name="...">
+            auto vpos = line.find("<volume name=\"");
+            if (vpos != std::string::npos) {
+                auto q1 = line.find('"', vpos + 14);
+                auto q2 = line.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos)
+                    current_lv = line.substr(q1 + 1, q2 - q1 - 1);
+            }
+            // match <physvol name="...">
+            auto ppos = line.find("<physvol name=\"");
+            if (ppos != std::string::npos) {
+                auto q1 = line.find('"', ppos + 15);
+                auto q2 = line.find('"', q1 + 1);
+                if (q1 != std::string::npos && q2 != std::string::npos) {
+                    std::string pv_name = line.substr(q1 + 1, q2 - q1 - 1);
+                    if (!current_lv.empty())
+                        pv_to_lv[pv_name] = current_lv;
+                }
+            }
+        }
+    }
+    std::cout << "PV->LV map entries: " << pv_to_lv.size() << std::endl;
+
     AssemblyBuilder builder;
 
     DetectorAssembly detector =
 
-        builder.Build(world);
+        builder.Build(world, pv_to_lv);
 
     // ------------------------------------------------------------
     // export key volumes as STL for the Python visualizer

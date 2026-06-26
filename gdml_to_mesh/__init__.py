@@ -173,6 +173,60 @@ def _load_result(work_dir: Path) -> GeometryResult:
         with open(meta / "surfaces.json") as f:
             surfaces = json.load(f)
 
+    # --------------------------------------------------------
+    # post-process: classify surface type from surfaces.json
+    # using pv_pair (border) or lv_skin (skin) matching,
+    # mirroring Geant4 surface resolution order.
+    # --------------------------------------------------------
+    if interfaces and surfaces:
+        border = {}
+        skin   = {}
+        for s in surfaces:
+            if s.get("type") == "border":
+                pair = s.get("pv_pair", [])
+                if len(pair) == 2:
+                    surf_type = s.get("surf_type", "")
+                    finish    = s.get("finish", "")
+                    if surf_type == "dielectric_metal":
+                        label = "blackbody"
+                    elif surf_type == "dielectric_dielectric":
+                        label = "specular"
+                    else:
+                        label = "default"
+                    border[(pair[0], pair[1])] = label
+                    border[(pair[1], pair[0])] = label
+            elif s.get("type") == "skin":
+                lv = s.get("lv_skin", "")
+                if lv:
+                    surf_type = s.get("surf_type", "")
+                    label = "blackbody" if surf_type == "dielectric_metal" else "specular"
+                    skin[lv] = label
+
+        for iface in interfaces:
+            if iface.get("surface") == "detector":
+                continue  # keep detector classification from C++
+            pv_in  = iface.get("pv_inside", "")
+            pv_out = iface.get("pv_outside", "")
+            lv_in  = iface.get("lv_inside", "")
+            lv_out = iface.get("lv_outside", "")
+            label = (border.get((pv_in, pv_out))
+                     or skin.get(lv_in)
+                     or skin.get(lv_out))
+            if label is None:
+                # fall back to material-based heuristic for known absorbers
+                mat_in  = iface.get("material_inside", "")
+                mat_out = iface.get("material_outside", "")
+                blackbody_mats = {"EnrichedGermanium0.076", "NaturalGermanium", "metal_copper"}
+                specular_mats  = {"PEN", "tpb_on_fibers"}
+                both = {mat_in, mat_out}
+                if both & blackbody_mats:
+                    label = "blackbody"
+                elif both & specular_mats:
+                    label = "specular"
+                else:
+                    label = "default"
+            iface["surface"] = label
+
     return GeometryResult(
         output_dir=work_dir,
         interfaces=interfaces,
