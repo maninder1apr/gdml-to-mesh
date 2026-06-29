@@ -580,6 +580,10 @@ void InterfaceExtractor::Extract(
                 const VolumeInstance& B = volumes[daughters[b]];
 
                 // gap-inflated bbox cull so touching pairs survive
+                // Skip pairs with identical materials — no optical interface possible
+                if (A.material == B.material)
+                    continue;
+
                 if (EnlargedBox(A.shape, fuzzy_mm)
                         .IsOut(EnlargedBox(B.shape, fuzzy_mm)))
                     continue;
@@ -621,6 +625,10 @@ void InterfaceExtractor::Extract(
 
         for (size_t di : daughters) {
             const VolumeInstance& daughter = volumes[di];
+
+            // Skip identical materials
+            if (mother.material == daughter.material)
+                continue;
 
             if (!BoxesOverlap(mother.shape, daughter.shape))
                 continue;

@@ -23,6 +23,8 @@
 #include <gp_Trsf.hxx>
 
 #include <iostream>
+#include <set>
+#include <string>
 
 // ============================================================
 // ctor
@@ -138,7 +140,21 @@ void AssemblyBuilder::Traverse(
     bool is_world =
         (pv->GetMotherLogical() == nullptr);
 
-    if (!is_world) {
+    // Skip volumes whose solid construction is known to be too complex
+    // (e.g. 24-deep boolean subtraction chains) or irrelevant for optical sim
+    static const std::set<std::string> kSkipNames = {
+        "SupportStructure_physical",
+        "TubeHolder_logical",
+    };
+    bool skip_this = false;
+    for (const auto& s : kSkipNames) {
+        if (pv->GetName().find(s) != std::string::npos) {
+            skip_this = true;
+            break;
+        }
+    }
+
+    if (!is_world && !skip_this) {
 
         auto* solid =
             lv->GetSolid();

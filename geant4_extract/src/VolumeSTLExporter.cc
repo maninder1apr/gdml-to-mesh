@@ -74,7 +74,7 @@ void VolumeSTLExporter::Export(
         // ----------------------------------------------------
 
         std::string path =
-            outDir + "/" + vol.name + ".stl";
+            outDir + "/" + vol.name + "_" + std::to_string(exported) + ".stl";
 
         StlAPI_Writer writer;
         writer.Write(vol.shape, path.c_str());

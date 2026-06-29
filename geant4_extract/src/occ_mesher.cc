@@ -189,7 +189,11 @@ void OCCMesher::run(
 
     VolumeSTLExporter volumeExporter;
 
-    volumeExporter.Export(detector, "cad/volumes");
+    // Export all placed volumes as STL (not just LEGEND defaults)
+    std::vector<std::string> allVolumeNames;
+    for (const auto& vol : detector.volumes)
+        allVolumeNames.push_back(vol.name);
+    volumeExporter.Export(detector, "cad/volumes", allVolumeNames);
 
     // ------------------------------------------------------------
     // extract touching interfaces
