@@ -1,8 +1,4 @@
-set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 cmake_minimum_required(VERSION 3.16)
-
-# Set policies to avoid compatibility warnings/errors with dependencies
-cmake_policy(VERSION 3.16)
 
 project(geant4_extract LANGUAGES CXX)
 
@@ -14,22 +10,13 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ============================================================
-# Geant4
+# dependencies
 # ============================================================
 
 find_package(Geant4 REQUIRED gdml)
-
-# ============================================================
-# OpenCASCADE
-# ============================================================
-
 find_package(OpenCASCADE REQUIRED)
-
-# ============================================================
-# zlib (for cnpy)
-# ============================================================
-
 find_package(ZLIB REQUIRED)
+find_package(OpenMP REQUIRED)
 
 # ============================================================
 # include directories
@@ -58,7 +45,7 @@ target_link_libraries(cnpy PUBLIC
 )
 
 # ============================================================
-# nlohmann_json using FetchContent
+# nlohmann_json
 # ============================================================
 
 include(FetchContent)
@@ -66,7 +53,7 @@ include(FetchContent)
 FetchContent_Declare(
     json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
-    GIT_TAG v3.11.2  # or use latest stable tag
+    GIT_TAG v3.11.2
 )
 
 FetchContent_MakeAvailable(json)
@@ -81,22 +68,19 @@ add_executable(occ_mesher
     src/SolidConverter.cc
     src/AssemblyBuilder.cc
     src/MaterialExporter.cc
-    src/SurfaceExporter.cc            # exports metadata/surfaces.json
+    src/SurfaceExporter.cc
     src/InterfaceExtractor.cc
     src/SurfaceMesher.cc
     src/VolumeMetadataExporter.cc
     src/VolumeSTLExporter.cc
 )
 
-target_include_directories(occ_mesher PUBLIC
-    include
-)
-
 target_link_libraries(occ_mesher
     cnpy
     ${Geant4_LIBRARIES}
     ${OpenCASCADE_LIBRARIES}
-    nlohmann_json::nlohmann_json      # Link JSON library
+    nlohmann_json::nlohmann_json
+    OpenMP::OpenMP_CXX
 )
 
 # ============================================================
@@ -110,7 +94,7 @@ add_executable(extract_mesh
 target_link_libraries(extract_mesh
     cnpy
     ${Geant4_LIBRARIES}
-    ${OpenCASCADE_LIBRARIES}       # optional (if mesh functions use OCC)
+    ${OpenCASCADE_LIBRARIES}
 )
 
 # ============================================================
@@ -124,11 +108,11 @@ add_executable(extract_placements
 target_link_libraries(extract_placements
     cnpy
     ${Geant4_LIBRARIES}
-    ${OpenCASCADE_LIBRARIES}       # optional (only needed if OCC used)
+    ${OpenCASCADE_LIBRARIES}
 )
 
 # ============================================================
-# extract_surfaces (NEEDS OpenCascade)
+# extract_surfaces
 # ============================================================
 
 add_executable(extract_surfaces

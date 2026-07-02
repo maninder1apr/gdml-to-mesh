@@ -47,23 +47,6 @@
 using json = nlohmann::json;
 
 // ============================================================
-// bbox overlap helper
-// ============================================================
-
-static bool BoxesOverlap(
-    const TopoDS_Shape& a,
-    const TopoDS_Shape& b
-) {
-    Bnd_Box boxA;
-    Bnd_Box boxB;
-
-    BRepBndLib::Add(a, boxA);
-    BRepBndLib::Add(b, boxB);
-
-    return !boxA.IsOut(boxB);
-}
-
-// ============================================================
 // HasRealSurface — reject null / empty-COMPOUND / degenerate
 // (edge-or-vertex-only) intersection results.
 //
@@ -229,12 +212,36 @@ static Bnd_Box EnlargedBox(const TopoDS_Shape& s, double gap)
 }
 
 // ============================================================
+// VolCache — per-volume bbox + exploded faces + per-face bbox,
+// all computed ONCE.
+//
+// Previously the O(N^2) pair loops rebuilt this data on every
+// candidate pair: the sibling cull called EnlargedBox() on both
+// shapes (a full BRepBndLib::Add each), and FindSharedFaces
+// re-exploded BOTH solids into faces + face boxes on every call.
+// With one flat mother (LAr) holding ~469 daughters that is
+// ~110k pairs, so each volume's box + face list was rebuilt
+// hundreds of times — the actual cause of the multi-hour run.
+// Caching turns the broad phase into O(1) precomputed box tests.
+// ============================================================
+
+struct VolCache {
+    Bnd_Box                  box;      // enlarged by fuzzy_mm
+    std::vector<TopoDS_Face> faces;
+    std::vector<Bnd_Box>     faceBox;  // each enlarged by fuzzy_mm
+};
+
+// ============================================================
 // FindSharedFaces — detect coincident faces between two solids.
 //
 // Iterates face pairs (bbox pre-filtered) and runs a 2D
 // face-on-face BRepAlgoAPI_Common with a fuzzy value. Coincident
 // faces yield a real-area patch; these are merged into one
 // compound. Returns a null shape if no genuine shared face.
+//
+// Retained for callers that pass DERIVED shapes not present in
+// the per-volume cache (steal_for passes flush footprints and
+// existing interface boundaries).
 // ============================================================
 
 static TopoDS_Shape FindSharedFaces(const TopoDS_Shape& solidA,
@@ -256,6 +263,47 @@ static TopoDS_Shape FindSharedFaces(const TopoDS_Shape& solidA,
         boxB.push_back(EnlargedBox(f, fuzzy_mm));
     }
 
+    BRep_Builder builder;
+    TopoDS_Compound out;
+    builder.MakeCompound(out);
+    bool any = false;
+
+    for (size_t a = 0; a < facesA.size(); ++a) {
+        for (size_t b = 0; b < facesB.size(); ++b) {
+
+            if (boxA[a].IsOut(boxB[b])) continue;   // face-level cull
+
+            BRepAlgoAPI_Common common(facesA[a], facesB[b]);
+            common.SetFuzzyValue(fuzzy_mm);
+            common.Build();
+            if (!common.IsDone()) continue;
+
+            TopoDS_Shape r = common.Shape();
+            if (!HasRealSurface(r, area_floor_mm2)) continue;
+
+            builder.Add(out, r);
+            any = true;
+        }
+    }
+
+    return any ? TopoDS_Shape(out) : TopoDS_Shape();
+}
+
+// ============================================================
+// FindSharedFacesCached — identical logic to FindSharedFaces but
+// takes precomputed faces + per-face boxes for both solids, so
+// nothing is re-exploded or re-boxed per pair. Used on the two
+// hot loops where both operands are cached volumes.
+// ============================================================
+
+static TopoDS_Shape FindSharedFacesCached(
+    const std::vector<TopoDS_Face>& facesA,
+    const std::vector<Bnd_Box>&     boxA,
+    const std::vector<TopoDS_Face>& facesB,
+    const std::vector<Bnd_Box>&     boxB,
+    double fuzzy_mm,
+    double area_floor_mm2)
+{
     BRep_Builder builder;
     TopoDS_Compound out;
     builder.MakeCompound(out);
@@ -429,6 +477,28 @@ void InterfaceExtractor::Extract(
     for (size_t i = 0; i < volumes.size(); ++i)
         children_of[volumes[i].mother_id].push_back(i);
 
+    // --------------------------------------------------------
+    // per-volume cache: bbox + faces + per-face bbox, computed
+    // ONCE (indexed by position in `volumes`, the same index
+    // stored in children_of / id_to_index). This replaces the
+    // repeated EnlargedBox()/face-explosion the pair loops used
+    // to do on every candidate pair.
+    // --------------------------------------------------------
+
+    std::vector<VolCache> cache(volumes.size());
+    for (size_t i = 0; i < volumes.size(); ++i) {
+        BRepBndLib::Add(volumes[i].shape, cache[i].box);
+        cache[i].box.Enlarge(fuzzy_mm);
+        for (TopExp_Explorer e(volumes[i].shape, TopAbs_FACE); e.More(); e.Next()) {
+            TopoDS_Face f = TopoDS::Face(e.Current());
+            Bnd_Box b;
+            BRepBndLib::Add(f, b);
+            b.Enlarge(fuzzy_mm);
+            cache[i].faces.push_back(f);
+            cache[i].faceBox.push_back(std::move(b));
+        }
+    }
+
     // shared sibling patches accumulated per daughter VOLUME id, to be
     // cut out of the corresponding mother↔daughter boundaries
     std::unordered_map<uint64_t, std::vector<TopoDS_Shape>> shared_per_daughter;
@@ -579,17 +649,20 @@ void InterfaceExtractor::Extract(
                 const VolumeInstance& A = volumes[daughters[a]];
                 const VolumeInstance& B = volumes[daughters[b]];
 
-                // gap-inflated bbox cull so touching pairs survive
                 // Skip pairs with identical materials — no optical interface possible
                 if (A.material == B.material)
                     continue;
 
-                if (EnlargedBox(A.shape, fuzzy_mm)
-                        .IsOut(EnlargedBox(B.shape, fuzzy_mm)))
+                // gap-inflated bbox cull so touching pairs survive
+                // (both cached boxes are already enlarged by fuzzy_mm)
+                if (cache[daughters[a]].box.IsOut(cache[daughters[b]].box))
                     continue;
 
                 TopoDS_Shape shared =
-                    FindSharedFaces(A.shape, B.shape, fuzzy_mm, kAreaFloor);
+                    FindSharedFacesCached(
+                        cache[daughters[a]].faces, cache[daughters[a]].faceBox,
+                        cache[daughters[b]].faces, cache[daughters[b]].faceBox,
+                        fuzzy_mm, kAreaFloor);
 
                 if (!HasRealSurface(shared, kAreaFloor))
                     continue;
@@ -630,7 +703,7 @@ void InterfaceExtractor::Extract(
             if (mother.material == daughter.material)
                 continue;
 
-            if (!BoxesOverlap(mother.shape, daughter.shape))
+            if (cache[mit->second].box.IsOut(cache[di].box))
                 continue;
 
             // faces of the daughter that lie flush against the mother's
@@ -638,7 +711,10 @@ void InterfaceExtractor::Extract(
             // There M has zero thickness: the surface there is really
             // daughter↔(whatever borders M), not mother↔daughter.
             TopoDS_Shape flush =
-                FindSharedFaces(mother.shape, daughter.shape, fuzzy_mm, kAreaFloor);
+                FindSharedFacesCached(
+                    cache[mit->second].faces, cache[mit->second].faceBox,
+                    cache[di].faces,          cache[di].faceBox,
+                    fuzzy_mm, kAreaFloor);
             bool has_flush = HasRealSurface(flush, kAreaFloor);
 
             // re-attribute M's outward surface under the flush
