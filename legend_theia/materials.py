@@ -43,17 +43,28 @@ def _mfp_to_coef(mfp_mm: np.ndarray) -> np.ndarray:
     """Convert mean free path in mm to absorption/scattering coefficient in 1/m."""
     return 1000.0 / np.clip(mfp_mm, 1e-6, None)
 
-def _compute_cdf(wavelengths, values, num_values=WAVELENGTH_N):
-    cdf = cumulative_trapezoid(values, wavelengths, initial=0)
-    cdf /= cdf[-1]
-    x_values = np.linspace(0, 1, num_values)
-    return np.interp(x_values, wavelengths, cdf)
+def _compute_cdf(wavelengths, values, num_values = 1024):
+    wl_support = np.linspace(wavelengths[0], wavelengths[-1], num_values)
+    values_interp = np.interp(wl_support, wavelengths, values)
 
-def _compute_ppf(wavelengths, values, num_values=WAVELENGTH_N):
-    cdf = cumulative_trapezoid(values, wavelengths, initial=0)
+    cdf = cumulative_trapezoid(values_interp, wl_support, initial=0)
+    # normalize
     cdf /= cdf[-1]
+
     x_values = np.linspace(0, 1, num_values)
-    return np.interp(x_values, cdf, wavelengths)
+    return np.interp(x_values, wl_support, cdf)
+
+def _compute_ppf(wavelengths, values, num_values = 1024):
+    wl_support = np.linspace(wavelengths[0], wavelengths[-1], num_values)
+    values_interp = np.interp(wl_support, wavelengths, values)
+
+    cdf = cumulative_trapezoid(values_interp, wl_support, initial=0)
+    # normalize
+    cdf /= cdf[-1]
+
+    x_values = np.linspace(0, 1, num_values)
+    # inverse cdf -> swap x-axis and y-axis
+    return np.interp(x_values, cdf, wl_support)
 
 
 def build_media(
@@ -219,7 +230,7 @@ def build_media(
 
         if ("WLSABSLENGTH" in props or "WLSMEANNUMBERPHOTONS" in props
                 or "WLSTIMECONSTANT" in props or "WLSCOMPONENT" in props):
-            volume_model = Fluorescent()
+            volume_model = Fluorescent(timeModel="exponential")
         elif("ABSLENGTH" in props or "RAYLEIGH" in props):
             volume_model = Attenuating()
         else:

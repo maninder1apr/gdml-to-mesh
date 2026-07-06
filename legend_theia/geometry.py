@@ -22,7 +22,7 @@ from theia.lookup import Table
 from theia.material import Material, MaterialFlags, MaterialStore, Medium
 from theia.property import FloatProperty, RoughUnifiedSurfacePPFProperty, TableProperty
 from theia.scene import MeshStore, RectBBox, Scene, Transform, loadMesh
-from theia.surface import AbsorbingSurface, DielectricRoughUnifiedSurface, DielectricSurface, DielectricMetalSurface
+from theia.surface import AbsorbingSurface, DielectricRoughSurface, DielectricSurface, MetalSurface
 
 from .materials import WAVELENGTH_MAX, WAVELENGTH_MIN, WAVELENGTH_N, build_media
 from .registry import canonical
@@ -157,7 +157,7 @@ def _surface_model(
                     if key in mpt:
                         props[prop_name] = FloatProperty(float(mpt[key]["value"]))
 
-                return DielectricRoughUnifiedSurface(), props
+                return DielectricRoughSurface(model="gaussian"), props
             else:
                 raise ValueError(
                     f"Unsupported unified surface finish: {finish!r} "
@@ -179,7 +179,7 @@ def _surface_model(
                 props["reflectivity"] = TableProperty(
                         Table(np.clip(np.interp(grid, wl, v), 0.0, 1.0), (wavelength_min, wavelength_max))
                     )
-                return DielectricMetalSurface(), props
+                return MetalSurface(), props
             else:
                 raise ValueError(
                     f"Unsupported unified surface finish: {finish!r} "
