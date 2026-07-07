@@ -105,9 +105,9 @@ void SurfaceMesher::MeshInterfaces(
 
     BRepMesh_IncrementalMesh mesher(
         iface.boundary,
-        0.1,            // linear deflection (relative fraction when isRelative)
+        0.01,            // linear deflection (relative fraction when isRelative)
         Standard_True,  // isRelative — scale tolerance to each face's size
-        0.5,            // angular deflection in radians (~28°)
+        0.05,            // angular deflection in radians (~2.8°)
         Standard_False  // NOT in parallel — outer OpenMP loop owns the cores
     );
 
