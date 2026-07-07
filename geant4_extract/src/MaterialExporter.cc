@@ -58,6 +58,12 @@ static std::string GetUnitForProperty(
     ) {
         return "dimensionless";
     }
+    
+    if (
+        name == "GROUPVEL"
+    ) {
+        return "mm/ns";
+    }
 
     if (
         name == "ABSLENGTH" ||
@@ -68,9 +74,12 @@ static std::string GetUnitForProperty(
     }
 
     if (
-        name == "FASTCOMPONENT" ||
-        name == "SLOWCOMPONENT" ||
-        name == "WLSCOMPONENT"
+        name == "FASTCOMPONENT"           ||
+        name == "SLOWCOMPONENT"           ||
+        name == "WLSCOMPONENT"            ||
+        name == "SCINTILLATIONCOMPONENT1" ||
+        name == "SCINTILLATIONCOMPONENT2" ||
+        name == "SCINTILLATIONCOMPONENT3"
     ) {
         return "relative";
     }
@@ -84,7 +93,8 @@ static std::string GetUnitForProperty(
 
 static double ConvertPropertyValue(
     const G4String& name,
-    double value
+    double value,
+    double wavelength
 ) {
 
     if (
@@ -93,6 +103,19 @@ static double ConvertPropertyValue(
         name == "WLSABSLENGTH"
     ) {
         return value / mm;
+    }
+
+    if (
+        name == "FASTCOMPONENT"           ||
+        name == "SLOWCOMPONENT"           ||
+        name == "WLSCOMPONENT"            ||
+        name == "SCINTILLATIONCOMPONENT1" ||
+        name == "SCINTILLATIONCOMPONENT2" ||
+        name == "SCINTILLATIONCOMPONENT3"
+    ) {
+        // we convert from energy spectrum to wavelength spectrum
+        // -> must correct by d E / d lambda ~ 1 / lambda^2
+        return value / (wavelength * wavelength); 
     }
 
     return value;
@@ -252,7 +275,8 @@ void MaterialExporter::Export(
                     double value =
                         ConvertPropertyValue(
                             name,
-                            (*vec)[k]
+                            (*vec)[k],
+                            wavelength_nm
                         );
 
                     points.push_back({

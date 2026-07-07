@@ -138,72 +138,52 @@ def build_media(
                 RayleighScatteringPhaseFunction().phase_sampling(cosines)
             )
 
-        if "SCINTILLATIONCOMPONENT1" in props:
-            p = props["SCINTILLATIONCOMPONENT1"]
-            kwargs["scintillation_spectrum_1_sampler"] = _prop01(
-                _compute_ppf(p["wavelength_nm"], p["values"])
-            )
+        for n in (1, 2, 3):
+            key = f"SCINTILLATIONCOMPONENT{n}"
+            if key in props:
+                p = props[key]
+                kwargs[f"scintillation_spectrum_{n}_sampler"] = _prop01(
+                    _compute_ppf(p["wavelength_nm"], p["values"])
+                )
 
-        if "SCINTILLATIONCOMPONENT2" in props:
-            p = props["SCINTILLATIONCOMPONENT2"]
-            kwargs["scintillation_spectrum_2_sampler"] = _prop01(
-                _compute_ppf(p["wavelength_nm"], p["values"])
-            )
+        for particle, suffix in (
+            ("", ""),
+            ("ELECTRON", "_electron"),
+            ("PROTON", "_proton"),
+            ("ALPHA", "_alpha"),
+            ("ION", "_ion"),
+            ("DEUTERON", "_deuteron"),
+            ("TRITON", "_triton"),
+        ):
+            for n in (1, 2, 3):
+                key = f"{particle}SCINTILLATIONTIMECONSTANT{n}"
+                if key in props:
+                    kwargs[f"scintillation_time_constant_{n}{suffix}"] = FloatProperty(
+                        float(props[key]["value"])
+                    )
 
-        if "SCINTILLATIONTIMECONSTANT1" in props:
-            kwargs["scintillation_time_constant_1"] = FloatProperty(
-                float(props["SCINTILLATIONTIMECONSTANT1"]["value"])
-            )
+            for n in (1, 2, 3):
+                key = f"{particle}SCINTILLATIONYIELD{n}"
+                if key in props:
+                    kwargs[f"scintillation_branching_ratio_{n}{suffix}"] = FloatProperty(
+                        float(props[key]["value"])
+                    )
 
-        if "SCINTILLATIONTIMECONSTANT2" in props:
-            kwargs["scintillation_time_constant_2"] = FloatProperty(
-                float(props["SCINTILLATIONTIMECONSTANT2"]["value"])
-            )
-
-        if "ELECTRONSCINTILLATIONYIELD1" in props:
-            kwargs["scintillation_branching_ratio_electron"] = FloatProperty(
-                float(props["ELECTRONSCINTILLATIONYIELD1"]["value"])
-            )
-
-        if "PROTONSCINTILLATIONYIELD1" in props:
-            kwargs["scintillation_branching_ratio_proton"] = FloatProperty(
-                float(props["PROTONSCINTILLATIONYIELD1"]["value"])
-            )
-
-        if "ALPHASCINTILLATIONYIELD1" in props:
-            kwargs["scintillation_branching_ratio_alpha"] = FloatProperty(
-                float(props["ALPHASCINTILLATIONYIELD1"]["value"])
-            )
-
-        if "IONSCINTILLATIONYIELD1" in props:
-            kwargs["scintillation_branching_ratio_ion"] = FloatProperty(
-                float(props["IONSCINTILLATIONYIELD1"]["value"])
-            )
-
-        if "ELECTRONSCINTILLATIONYIELD" in props:
-            p = props["ELECTRONSCINTILLATIONYIELD"]
-            scint_yield = p["values"][0] * 806554.394 * p["wavelength_nm"][0] * 1e-9 / u.eV
-            kwargs["scintillation_yield_electron"] = FloatProperty(float(scint_yield))
-
-        if "PROTONSCINTILLATIONYIELD" in props:
-            p = props["PROTONSCINTILLATIONYIELD"]
-            scint_yield = p["values"][0] * 806554.394 * p["wavelength_nm"][0] * 1e-9 / u.eV
-            kwargs["scintillation_yield_proton"] = FloatProperty(float(scint_yield))
-
-        if "ALPHASCINTILLATIONYIELD" in props:
-            p = props["ALPHASCINTILLATIONYIELD"]
-            scint_yield = p["values"][0] * 806554.394 * p["wavelength_nm"][0] * 1e-9 / u.eV
-            kwargs["scintillation_yield_alpha"] = FloatProperty(float(scint_yield))
-
-        if "IONSCINTILLATIONYIELD" in props:
-            p = props["IONSCINTILLATIONYIELD"]
-            scint_yield = p["values"][0] * 806554.394 * p["wavelength_nm"][0] * 1e-9 / u.eV
-            kwargs["scintillation_yield_ion"] = FloatProperty(float(scint_yield))
+            key = f"{particle}SCINTILLATIONYIELD"
+            if key in props:
+                p = props[key]
+                scint_yield = p["values"][0] * 806554.394 * p["wavelength_nm"][0] * 1e-9 / u.eV
+                kwargs[f"scintillation_yield{suffix}"] = FloatProperty(float(scint_yield))
 
         if "RESOLUTIONSCALE" in props:
             kwargs["scintillation_resolutionscale"] = FloatProperty(
                 float(props["RESOLUTIONSCALE"]["value"])
             )
+
+        for n in (1, 2, 3):
+            key = f"SCINTILLATIONRISETIME{n}"
+            if key in props:
+                kwargs[f"scintillation_rise_time_{n}"] = FloatProperty(float(props[key]["value"]))
 
         if "WLSABSLENGTH" in props:
             p = props["WLSABSLENGTH"]
