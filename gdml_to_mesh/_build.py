@@ -53,6 +53,7 @@ def build(verbose: bool = False, jobs: int = 8) -> None:
         f"-DHDF5_DIR={cmake_dir(hdf5, 'cmake', 'lib/cmake/hdf5', 'share/cmake/hdf5')}",
         f"-DQt5_DIR={cmake_dir(qt5, 'lib/cmake/Qt5')}",
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
     ]
 
     # pass conda prefix to help cmake find things
