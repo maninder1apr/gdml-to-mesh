@@ -58,7 +58,7 @@ static std::string GetUnitForProperty(
     ) {
         return "dimensionless";
     }
-    
+
     if (
         name == "GROUPVEL"
     ) {
@@ -115,7 +115,7 @@ static double ConvertPropertyValue(
     ) {
         // we convert from energy spectrum to wavelength spectrum
         // -> must correct by d E / d lambda ~ 1 / lambda^2
-        return value / (wavelength * wavelength); 
+        return value / (wavelength * wavelength);
     }
 
     return value;
