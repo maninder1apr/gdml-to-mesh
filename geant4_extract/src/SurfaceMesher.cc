@@ -13,7 +13,14 @@
 
 #include <StlAPI_Writer.hxx>
 
+#include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
+#include <cmath>
+#include <gp_Pnt.hxx>
+#include <gp_Vec.hxx>
+#include <map>
+#include <tuple>
+#include <unordered_map>
 
 #include <TopExp_Explorer.hxx>
 
@@ -37,6 +44,70 @@ namespace fs = std::filesystem;
 // are not needed for plotting or for Theia and roughly double the file
 // count, so the default run skips them.
 static constexpr bool kWriteBrep = false;
+
+// ============================================================
+// mesh-quality audit helpers
+//
+// A boundary compound's faces each carry their own independent
+// Poly_Triangulation (own local node indices), so a shared edge
+// between two faces can't be found by comparing node indices —
+// it has to be identified by position. Edges are keyed by their
+// two endpoints quantized to kEdgeQuantum and canonically ordered
+// so a given physical edge hashes the same regardless of which
+// triangle/winding visited it first. Count == 1 → open (boundary)
+// edge; count > 2 → non-manifold (overlapping/duplicated) edge;
+// count == 2 is the expected interior case for a closed surface.
+// ============================================================
+
+namespace {
+
+constexpr double kEdgeQuantum = 1e-4; // mm — matches the 0.1 µm eps used
+                                       // for normal-direction sampling
+constexpr double kDegenerateAreaFloor = 1e-9; // mm^2
+
+struct EdgeKey {
+  long long ax, ay, az, bx, by, bz;
+  bool operator==(const EdgeKey &o) const {
+    return ax == o.ax && ay == o.ay && az == o.az && bx == o.bx &&
+           by == o.by && bz == o.bz;
+  }
+};
+
+struct EdgeKeyHash {
+  size_t operator()(const EdgeKey &k) const {
+    size_t h = 1469598103934665603ULL;
+    auto mix = [&](long long v) {
+      h ^= static_cast<size_t>(v);
+      h *= 1099511628211ULL;
+    };
+    mix(k.ax);
+    mix(k.ay);
+    mix(k.az);
+    mix(k.bx);
+    mix(k.by);
+    mix(k.bz);
+    return h;
+  }
+};
+
+long long QuantizeCoord(double v) {
+  return static_cast<long long>(std::llround(v / kEdgeQuantum));
+}
+
+EdgeKey MakeEdgeKey(const gp_Pnt &p, const gp_Pnt &q) {
+  long long ax = QuantizeCoord(p.X()), ay = QuantizeCoord(p.Y()),
+            az = QuantizeCoord(p.Z());
+  long long bx = QuantizeCoord(q.X()), by = QuantizeCoord(q.Y()),
+            bz = QuantizeCoord(q.Z());
+  if (std::tie(ax, ay, az) > std::tie(bx, by, bz)) {
+    std::swap(ax, bx);
+    std::swap(ay, by);
+    std::swap(az, bz);
+  }
+  return {ax, ay, az, bx, by, bz};
+}
+
+} // namespace
 
 // ============================================================
 // mesh all optical interfaces
@@ -105,10 +176,10 @@ void SurfaceMesher::MeshInterfaces(
 
     BRepMesh_IncrementalMesh mesher(
         iface.boundary,
-        0.1,            // linear deflection (relative fraction when isRelative)
-        Standard_True,  // isRelative — scale tolerance to each face's size
-        0.5,            // angular deflection in radians (~28°)
-        Standard_False  // NOT in parallel — outer OpenMP loop owns the cores
+        0.1,           // linear deflection (relative fraction when isRelative)
+        Standard_True, // isRelative — scale tolerance to each face's size
+        0.5,           // angular deflection in radians (~28°)
+        Standard_False // NOT in parallel — outer OpenMP loop owns the cores
     );
 
     mesher.Perform();
@@ -139,13 +210,16 @@ void SurfaceMesher::MeshInterfaces(
     size_t total_vertices = 0;
     size_t total_triangles = 0;
     size_t total_faces = 0;
+    double mesh_area_mm2 = 0.0;
+    int degenerate_tris = 0;
+    std::unordered_map<EdgeKey, int, EdgeKeyHash> edge_count;
 
     // ----------------------------------------------------
     // iterate surface faces
     // ----------------------------------------------------
 
-    for (TopExp_Explorer explorer(iface.boundary, TopAbs_FACE);
-         explorer.More(); explorer.Next()) {
+    for (TopExp_Explorer explorer(iface.boundary, TopAbs_FACE); explorer.More();
+         explorer.Next()) {
 
       total_faces++;
 
@@ -161,6 +235,38 @@ void SurfaceMesher::MeshInterfaces(
 
       total_vertices += triangulation->NbNodes();
       total_triangles += triangulation->NbTriangles();
+
+      const gp_Trsf &trsf = location.Transformation();
+
+      // Faces are independently triangulated (their own local node
+      // indexing), so edges shared across faces can only be matched
+      // by transformed 3D position, not by node index.
+      for (int t = 1; t <= triangulation->NbTriangles(); ++t) {
+        int i1, i2, i3;
+        triangulation->Triangle(t).Get(i1, i2, i3);
+
+        gp_Pnt p1 = triangulation->Node(i1).Transformed(trsf);
+        gp_Pnt p2 = triangulation->Node(i2).Transformed(trsf);
+        gp_Pnt p3 = triangulation->Node(i3).Transformed(trsf);
+
+        gp_Vec e1(p1, p2), e2(p1, p3);
+        double tri_area = 0.5 * e1.Crossed(e2).Magnitude();
+        mesh_area_mm2 += tri_area;
+        if (tri_area < kDegenerateAreaFloor)
+          ++degenerate_tris;
+
+        ++edge_count[MakeEdgeKey(p1, p2)];
+        ++edge_count[MakeEdgeKey(p2, p3)];
+        ++edge_count[MakeEdgeKey(p3, p1)];
+      }
+    }
+
+    int open_edges = 0, nonmanifold_edges = 0;
+    for (const auto &kv : edge_count) {
+      if (kv.second == 1)
+        ++open_edges;
+      else if (kv.second > 2)
+        ++nonmanifold_edges;
     }
 
     // ----------------------------------------------------
@@ -177,26 +283,65 @@ void SurfaceMesher::MeshInterfaces(
 
     iface.n_triangles = (int)total_triangles;
     iface.area_mm2 = area_mm2;
+    iface.mesh_area_mm2 = mesh_area_mm2;
+    iface.occ_area_mm2 = area_mm2;
+    iface.n_open_edges = open_edges;
+    iface.n_nonmanifold_edges = nonmanifold_edges;
+    iface.n_degenerate_tris = degenerate_tris;
+    iface.mesh_empty = (total_triangles == 0);
+
+    bool broken = iface.mesh_empty || open_edges > 0 || nonmanifold_edges > 0 ||
+                 degenerate_tris > 0;
 
     // ----------------------------------------------------
     // report
     // ----------------------------------------------------
 
 #pragma omp critical(mesher_cout)
-    std::cout << "Interface " << iface.id << " : " << iface.materialA << " ↔ "
-              << iface.materialB << "\n"
-              << "  shape type = " << shape_type << "\n"
-              << "  faces      = " << total_faces << "\n"
-              << "  vertices   = " << total_vertices << "\n"
-              << "  triangles  = " << total_triangles << "\n"
-              << "  area_mm2   = " << area_mm2 << "\n"
-              << "  brep file  = " << (kWriteBrep ? brep_name : "(skipped)")
-              << "\n"
-              << "  stl file   = " << stl_name << "\n"
-              << std::endl;
+    {
+      std::cout << "Interface " << iface.id << " : " << iface.materialA
+                << " ↔ " << iface.materialB << "\n"
+                << "  shape type = " << shape_type << "\n"
+                << "  faces      = " << total_faces << "\n"
+                << "  vertices   = " << total_vertices << "\n"
+                << "  triangles  = " << total_triangles << "\n"
+                << "  area_mm2   = " << area_mm2 << " (mesh: " << mesh_area_mm2
+                << ")\n"
+                << "  brep file  = " << (kWriteBrep ? brep_name : "(skipped)")
+                << "\n"
+                << "  stl file   = " << stl_name << "\n";
+      if (broken) {
+        std::cout << "  [WARN] mesh quality: open_edges=" << open_edges
+                  << " nonmanifold_edges=" << nonmanifold_edges
+                  << " degenerate_tris=" << degenerate_tris
+                  << (iface.mesh_empty ? " (EMPTY MESH)" : "") << "\n";
+      }
+      std::cout << std::endl;
+    }
   }
 
   std::cout << "Finished interface meshing.\n" << std::endl;
+
+  // --------------------------------------------------------
+  // mesh-quality summary
+  // --------------------------------------------------------
+
+  {
+    int n_broken = 0;
+    for (const auto &iface : assembly.interfaces) {
+      if (iface.mesh_empty || iface.n_open_edges > 0 ||
+          iface.n_nonmanifold_edges > 0 || iface.n_degenerate_tris > 0)
+        ++n_broken;
+    }
+    if (n_broken > 0) {
+      std::cout << "[WARN] " << n_broken << " / " << assembly.interfaces.size()
+                << " interfaces have mesh-quality issues (open/non-manifold "
+                   "edges, degenerate triangles, or empty mesh) — see "
+                   "n_open_edges/n_nonmanifold_edges/n_degenerate_tris/"
+                   "mesh_empty in interfaces.json\n"
+                << std::endl;
+    }
+  }
 
   // --------------------------------------------------------
   // write interfaces.json now that all stats are populated
