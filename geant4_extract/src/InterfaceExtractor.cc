@@ -30,19 +30,27 @@
 
 #include <BRepClass3d_SolidClassifier.hxx>
 
+#include <ShapeUpgrade_UnifySameDomain.hxx>
+
 #include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <map>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 using json = nlohmann::json;
 
@@ -205,6 +213,35 @@ static Bnd_Box EnlargedBox(const TopoDS_Shape &s, double gap) {
 }
 
 // ============================================================
+// AdaptiveFuzzy — scale the coincident-face tolerance to the size
+// of the pair actually being compared, instead of one fixed value
+// for everything.
+//
+// A single flat fuzzy_mm (e.g. 1e-4 mm) is appropriate for small,
+// tessellated parts (PMT brackets etc — confirmed working after the
+// GDML vertex-collision fix), but a huge curved/revolved shape like
+// Gel_physical<->PressureVessel_0 (bbox diagonal in the hundreds of
+// mm) has consistently shown partial, under-removed subtraction
+// (~83-88% instead of ~100%) even after every other fix this
+// session — a tolerance that's tiny relative to that shape's own
+// scale is a plausible reason a "coincident" surface isn't quite
+// being recognized as such. Scales UP for large pairs (relative to
+// their own size) while never going below the existing floor, so
+// small parts keep exactly the tolerance already proven to work.
+// ============================================================
+
+static constexpr double kFuzzyRelFrac = 1e-5; // fraction of the smaller
+                                              // pair member's bbox diagonal
+static constexpr double kFuzzyCeiling = 1e-2; // mm — safety cap (matches
+                                              // the largest value already
+                                              // tested this session)
+
+static double AdaptiveFuzzy(double sizeA, double sizeB, double floor_mm) {
+  double sz = std::min(sizeA, sizeB);
+  return std::min(std::max(floor_mm, kFuzzyRelFrac * sz), kFuzzyCeiling);
+}
+
+// ============================================================
 // VolCache — per-volume bbox + exploded faces + per-face bbox,
 // all computed ONCE.
 //
@@ -216,12 +253,47 @@ static Bnd_Box EnlargedBox(const TopoDS_Shape &s, double gap) {
 // ~110k pairs, so each volume's box + face list was rebuilt
 // hundreds of times — the actual cause of the multi-hour run.
 // Caching turns the broad phase into O(1) precomputed box tests.
+//
+// box is enlarged by kFuzzyCeiling (not the plain floor fuzzy_mm)
+// so the broad-phase cull stays valid no matter which adaptive
+// tolerance a given pair ends up using — it must never be tighter
+// than the finest possible per-pair value used downstream.
 // ============================================================
 
 struct VolCache {
-  Bnd_Box box; // enlarged by fuzzy_mm
+  Bnd_Box box; // enlarged by kFuzzyCeiling
   std::vector<TopoDS_Face> faces;
-  std::vector<Bnd_Box> faceBox; // each enlarged by fuzzy_mm
+  std::vector<Bnd_Box> faceBox; // each enlarged by kFuzzyCeiling
+  double size = 0.0;            // bbox diagonal (mm), for AdaptiveFuzzy
+};
+
+// ============================================================
+// GridKey/GridKeyHash — integer grid-cell coordinate, used to bucket
+// daughters spatially so the sibling-pair loop doesn't have to
+// enumerate every possible pair (see the sibling-pair candidate
+// generation below). Same FNV-1a-style hash pattern as SurfaceMesher's
+// EdgeKey, kept local here since it's file-specific.
+// ============================================================
+
+struct GridKey {
+  long long x, y, z;
+  bool operator==(const GridKey &o) const {
+    return x == o.x && y == o.y && z == o.z;
+  }
+};
+
+struct GridKeyHash {
+  size_t operator()(const GridKey &k) const {
+    size_t h = 1469598103934665603ULL;
+    auto mix = [&](long long v) {
+      h ^= static_cast<size_t>(v);
+      h *= 1099511628211ULL;
+    };
+    mix(k.x);
+    mix(k.y);
+    mix(k.z);
+    return h;
+  }
 };
 
 // ============================================================
@@ -349,6 +421,41 @@ static TopoDS_Shape ToFaceCompound(const TopoDS_Shape &s) {
 }
 
 // ============================================================
+// UnifyCoplanarFaces — merge a shape's many small same-domain
+// (coplanar/connected) faces into far fewer, larger faces.
+//
+// Tessellated solids are fan-triangulated into hundreds of tiny
+// individual planar faces. SubtractPatches's face-by-face Cut was
+// designed assuming "one real flat wall vs. one overlapping patch"
+// — a clean coplanar 2D cut. Instead it was getting "one tiny
+// triangle vs. up to ~800 tiny triangles from a differently-
+// tessellated neighbour", which is a far messier Boolean input:
+// confirmed via [DIAG] instrumentation that BRepAlgoAPI_Cut
+// reported success (IsDone()) while silently removing only 6-12%
+// of the true overlap, regardless of how precisely the candidate
+// patches were bbox-culled. Unifying same-domain faces first turns
+// that back into the small number of real, large flat faces the
+// algorithm actually expects. Falls back to the original shape if
+// unification fails — never worse than before.
+// ============================================================
+
+static TopoDS_Shape UnifyCoplanarFaces(const TopoDS_Shape &s) {
+  if (s.IsNull())
+    return s;
+  try {
+    ShapeUpgrade_UnifySameDomain unify(s, /*UnifyEdges=*/true,
+                                       /*UnifyFaces=*/true,
+                                       /*ConcatBSplines=*/false);
+    unify.Build();
+    TopoDS_Shape result = unify.Shape();
+    if (!result.IsNull())
+      return result;
+  } catch (...) {
+  }
+  return s;
+}
+
+// ============================================================
 // SubtractPatches — remove shared sibling patches from a
 // mother↔daughter boundary so each surface region belongs to
 // exactly one interface (no double coverage).
@@ -358,22 +465,78 @@ static TopoDS_Shape ToFaceCompound(const TopoDS_Shape &s) {
 // is kept and a warning is logged — never silently wrong.
 // ============================================================
 
-static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary,
+static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary_raw,
                                     const std::vector<TopoDS_Shape> &patches,
                                     double fuzzy_mm, double area_floor_mm2,
                                     int iface_id, bool &warned) {
   if (patches.empty())
-    return ToFaceCompound(boundary); // fast path: no sibling contact, but
-                                      // still normalize a raw solid down to
-                                      // its face compound (see above)
+    return ToFaceCompound(boundary_raw); // fast path: no sibling contact,
+                                          // but still normalize a raw solid
+                                          // down to its face compound
 
-  std::vector<Bnd_Box> pbox(patches.size());
+  // Merge each side's many small tessellation-derived faces into fewer,
+  // larger same-domain faces before doing any per-face Cut work below
+  // (see UnifyCoplanarFaces).
+  TopoDS_Shape boundary = UnifyCoplanarFaces(boundary_raw);
+
+  // Sanity check: two DIFFERENT sibling-contact patches on the same
+  // daughter should not themselves overlap each other — that would mean
+  // the same physical region got claimed as touching two different
+  // neighbours (seen in practice: a daughter with many siblings where
+  // FindSharedFacesCached returned near the daughter's ENTIRE surface
+  // as "shared" with several of them at once). Bbox-culled first (same
+  // pattern as everywhere else in this file) so this stays cheap for
+  // the common case of few, non-overlapping patches — only patches
+  // whose boxes actually overlap pay for the real Boolean below.
+  if (patches.size() > 1) {
+    std::vector<Bnd_Box> patchBox(patches.size());
+    std::vector<double> patchArea(patches.size());
+    for (size_t k = 0; k < patches.size(); ++k) {
+      patchBox[k] = EnlargedBox(patches[k], fuzzy_mm);
+      GProp_GProps pp;
+      BRepGProp::SurfaceProperties(patches[k], pp);
+      patchArea[k] = pp.Mass();
+    }
+    int suspicious = 0;
+    for (size_t i = 0; i < patches.size(); ++i) {
+      for (size_t j = i + 1; j < patches.size(); ++j) {
+        if (patchBox[i].IsOut(patchBox[j]))
+          continue; // not touching -> skip the expensive Boolean entirely
+        BRepAlgoAPI_Common common(patches[i], patches[j]);
+        common.SetFuzzyValue(fuzzy_mm);
+        common.Build();
+        if (!common.IsDone())
+          continue;
+        GProp_GProps op;
+        BRepGProp::SurfaceProperties(common.Shape(), op);
+        double overlap_area = op.Mass();
+        // flag only a SUSPICIOUS (near-total) overlap, not incidental
+        // edge-sharing between two genuinely distinct small patches
+        if (overlap_area > 0.5 * std::min(patchArea[i], patchArea[j]))
+          ++suspicious;
+      }
+    }
+    if (suspicious > 0 && !warned) {
+      std::cout << "  [WARN] interface " << iface_id << ": " << suspicious
+                << " sibling-contact patch pair(s) suspiciously overlap "
+                   "each other (possible double-counted contact)\n";
+      warned = true;
+    }
+  }
+
+  std::vector<TopoDS_Face> subfaces;
+  std::vector<Bnd_Box> subbox;
   double sum_patch_area = 0.0;
-  for (size_t k = 0; k < patches.size(); ++k) {
-    pbox[k] = EnlargedBox(patches[k], fuzzy_mm);
+  for (const auto &patch : patches) {
+    TopoDS_Shape unified_patch = UnifyCoplanarFaces(patch);
     GProp_GProps pp;
-    BRepGProp::SurfaceProperties(patches[k], pp);
+    BRepGProp::SurfaceProperties(unified_patch, pp);
     sum_patch_area += pp.Mass();
+    for (TopExp_Explorer pe(unified_patch, TopAbs_FACE); pe.More(); pe.Next()) {
+      TopoDS_Face pf = TopoDS::Face(pe.Current());
+      subfaces.push_back(pf);
+      subbox.push_back(EnlargedBox(pf, fuzzy_mm));
+    }
   }
 
   BRep_Builder builder;
@@ -386,17 +549,17 @@ static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary,
     TopoDS_Face f = TopoDS::Face(e.Current());
     Bnd_Box fb = EnlargedBox(f, fuzzy_mm);
 
-    // collect patches whose bbox overlaps this face's bbox. Note a
+    // collect patch SUB-FACES whose bbox overlaps this face's bbox. Note a
     // bbox overlap does NOT imply coplanarity (a perpendicular
     // neighbour face shares an edge); the Cut simply removes nothing
     // for non-coplanar patches, which is correct.
     TopoDS_Compound local;
     builder.MakeCompound(local);
     bool hasLocal = false;
-    for (size_t k = 0; k < patches.size(); ++k) {
-      if (fb.IsOut(pbox[k]))
+    for (size_t k = 0; k < subfaces.size(); ++k) {
+      if (fb.IsOut(subbox[k]))
         continue;
-      builder.Add(local, patches[k]);
+      builder.Add(local, subfaces[k]);
       hasLocal = true;
     }
 
@@ -503,12 +666,18 @@ void InterfaceExtractor::Extract(
   std::vector<VolCache> cache(volumes.size());
   for (size_t i = 0; i < volumes.size(); ++i) {
     BRepBndLib::Add(volumes[i].shape, cache[i].box);
-    cache[i].box.Enlarge(fuzzy_mm);
+    cache[i].box.Enlarge(kFuzzyCeiling);
+    {
+      double xmin, ymin, zmin, xmax, ymax, zmax;
+      cache[i].box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+      double dx = xmax - xmin, dy = ymax - ymin, dz = zmax - zmin;
+      cache[i].size = std::sqrt(dx * dx + dy * dy + dz * dz);
+    }
     for (TopExp_Explorer e(volumes[i].shape, TopAbs_FACE); e.More(); e.Next()) {
       TopoDS_Face f = TopoDS::Face(e.Current());
       Bnd_Box b;
       BRepBndLib::Add(f, b);
-      b.Enlarge(fuzzy_mm);
+      b.Enlarge(kFuzzyCeiling);
       cache[i].faces.push_back(f);
       cache[i].faceBox.push_back(std::move(b));
     }
@@ -669,52 +838,132 @@ void InterfaceExtractor::Extract(
 
     // ====================================================
     // (1) sibling ↔ sibling: shared coincident faces
+    //
+    // Candidate pairs come from a spatial grid instead of enumerating
+    // every possible pair. A flat mother with N daughters (e.g. a bulk
+    // LAr volume with ~469 daughters) has N*(N-1)/2 pairs — ~110k for
+    // 469 — and even an O(1) bbox test per pair doesn't scale well at
+    // that count (this is the exact case earlier comments in this
+    // file already called out as the original multi-hour bottleneck).
+    // Bucketing each daughter into every grid cell its bbox spans
+    // (handles daughters bigger than one cell) guarantees two
+    // daughters can only become a candidate pair if they share a
+    // cell — which always holds whenever their boxes actually
+    // overlap. Cell size is the group's own median daughter size, so
+    // it adapts to whatever scale a given mother's daughters are at
+    // instead of using one fixed size for every group. The existing
+    // per-pair box.IsOut() check right after this still runs as a
+    // final, exact correctness check — the grid is purely a broad-
+    // phase filter, never a source of missed pairs.
+    //
+    // Flattened into a single pair list (rather than a nested a/b
+    // loop) so it can be handed to a plain #pragma omp parallel for
+    // — each pair's FindSharedFacesCached/boolean work is independent
+    // and often the most expensive part of this whole function;
+    // dynamic scheduling matches SurfaceMesher's rationale
+    // (bbox-culled pairs are ~free, pairs with real contact do an
+    // actual boolean).
+    //
+    // Only the shared-state mutations (shared_per_daughter,
+    // assembly.interfaces / interfaces_of_volume via emit(), and
+    // the console log) are protected by a critical section; the
+    // geometry work itself runs lock-free.
     // ====================================================
 
-    for (size_t a = 0; a < daughters.size(); ++a) {
-      for (size_t b = a + 1; b < daughters.size(); ++b) {
-        const VolumeInstance &A = volumes[daughters[a]];
-        const VolumeInstance &B = volumes[daughters[b]];
+    std::vector<std::pair<size_t, size_t>> sibling_pairs;
+    if (daughters.size() > 1) {
+      std::vector<double> sorted_sizes;
+      sorted_sizes.reserve(daughters.size());
+      for (size_t d : daughters)
+        sorted_sizes.push_back(cache[d].size);
+      std::sort(sorted_sizes.begin(), sorted_sizes.end());
+      double cell = sorted_sizes[sorted_sizes.size() / 2];
+      if (!(cell > 0.0))
+        cell = 1.0; // guard against a degenerate/zero-size group
 
-        // Same-material siblings produce no OPTICAL interface, but
-        // their contact patch still exists physically and must
-        // still be subtracted from each daughter's mother boundary.
-        // Skipping the geometry check here (as before) silently
-        // starves shared_per_daughter, letting the FULL un-subtracted
-        // daughter surface leak into the mother interface instead —
-        // this is what inflated DynodeSupportStructure/Dynodes/etc.
-        bool same_material = (A.material == B.material);
+      std::unordered_map<GridKey, std::vector<size_t>, GridKeyHash> grid;
+      for (size_t a = 0; a < daughters.size(); ++a) {
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        cache[daughters[a]].box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        long long ixmin = (long long)std::floor(xmin / cell);
+        long long ixmax = (long long)std::floor(xmax / cell);
+        long long iymin = (long long)std::floor(ymin / cell);
+        long long iymax = (long long)std::floor(ymax / cell);
+        long long izmin = (long long)std::floor(zmin / cell);
+        long long izmax = (long long)std::floor(zmax / cell);
+        for (long long ix = ixmin; ix <= ixmax; ++ix)
+          for (long long iy = iymin; iy <= iymax; ++iy)
+            for (long long iz = izmin; iz <= izmax; ++iz)
+              grid[{ix, iy, iz}].push_back(a);
+      }
 
-        // gap-inflated bbox cull so touching pairs survive
-        // (both cached boxes are already enlarged by fuzzy_mm)
-        if (cache[daughters[a]].box.IsOut(cache[daughters[b]].box))
-          continue;
+      std::unordered_set<uint64_t> seen_pairs;
+      for (const auto &kv : grid) {
+        const std::vector<size_t> &bucket = kv.second;
+        for (size_t i = 0; i < bucket.size(); ++i) {
+          for (size_t j = i + 1; j < bucket.size(); ++j) {
+            size_t a = bucket[i], b = bucket[j];
+            if (a > b)
+              std::swap(a, b);
+            uint64_t key = (uint64_t(a) << 32) | uint64_t(b);
+            if (seen_pairs.insert(key).second)
+              sibling_pairs.emplace_back(a, b);
+          }
+        }
+      }
+    }
 
-        TopoDS_Shape shared = FindSharedFacesCached(
-            cache[daughters[a]].faces, cache[daughters[a]].faceBox,
-            cache[daughters[b]].faces, cache[daughters[b]].faceBox, fuzzy_mm,
-            kAreaFloor);
+#pragma omp parallel for schedule(dynamic)
+    for (size_t p = 0; p < sibling_pairs.size(); ++p) {
+      size_t a = sibling_pairs[p].first;
+      size_t b = sibling_pairs[p].second;
+      const VolumeInstance &A = volumes[daughters[a]];
+      const VolumeInstance &B = volumes[daughters[b]];
 
-        if (!HasRealSurface(shared, kAreaFloor))
-          continue;
+      // Same-material siblings produce no OPTICAL interface, but
+      // their contact patch still exists physically and must
+      // still be subtracted from each daughter's mother boundary.
+      // Skipping the geometry check here (as before) silently
+      // starves shared_per_daughter, letting the FULL un-subtracted
+      // daughter surface leak into the mother interface instead —
+      // this is what inflated DynodeSupportStructure/Dynodes/etc.
+      bool same_material = (A.material == B.material);
 
-        // always record the contact patch so it gets subtracted
-        // from both daughters' mother boundaries, regardless of
-        // whether an optical interface is emitted for it
+      // gap-inflated bbox cull so touching pairs survive
+      // (both cached boxes are already enlarged by kFuzzyCeiling)
+      if (cache[daughters[a]].box.IsOut(cache[daughters[b]].box))
+        continue;
+
+      double pair_fuzzy = AdaptiveFuzzy(cache[daughters[a]].size,
+                                        cache[daughters[b]].size, fuzzy_mm);
+      TopoDS_Shape shared = FindSharedFacesCached(
+          cache[daughters[a]].faces, cache[daughters[a]].faceBox,
+          cache[daughters[b]].faces, cache[daughters[b]].faceBox, pair_fuzzy,
+          kAreaFloor);
+
+      if (!HasRealSurface(shared, kAreaFloor))
+        continue;
+
+      // always record the contact patch so it gets subtracted
+      // from both daughters' mother boundaries, regardless of
+      // whether an optical interface is emitted for it
+#pragma omp critical(iface_extract)
+      {
         shared_per_daughter[A.id].push_back(shared);
         shared_per_daughter[B.id].push_back(shared);
-
-        if (same_material)
-          continue; // no optical interface between identical media
-
-        bool A_det = is_det(A);
-        bool B_det = is_det(B);
-
-        OrientResult orient =
-            OrientInterfaceClassifier(shared, A, B, A_det, B_det);
-
-        emit(A, B, orient, A_det, B_det);
       }
+
+      if (same_material)
+        continue; // no optical interface between identical media
+
+      bool A_det = is_det(A);
+      bool B_det = is_det(B);
+
+      OrientResult orient =
+          OrientInterfaceClassifier(shared, A, B, A_det, B_det);
+
+#pragma omp critical(iface_extract)
+      emit(A, B, orient, A_det, B_det);
     }
 
     // ====================================================
@@ -732,7 +981,15 @@ void InterfaceExtractor::Extract(
     const VolumeInstance &mother = volumes[mit->second];
     bool mother_det = is_det(mother);
 
-    for (size_t di : daughters) {
+    // Each daughter's flush/boolean/subtract work is independent and
+    // often the most expensive part of this loop; parallelized the
+    // same way as the sibling pairs above. steal_for() mutates OTHER
+    // already-emitted interfaces (possibly touched by more than one
+    // daughter here), so its whole call is serialized — cheap relative
+    // to the boolean-heavy work already running lock-free elsewhere.
+#pragma omp parallel for schedule(dynamic)
+    for (size_t dpos = 0; dpos < daughters.size(); ++dpos) {
+      size_t di = daughters[dpos];
       const VolumeInstance &daughter = volumes[di];
 
       // Skip identical materials
@@ -742,20 +999,25 @@ void InterfaceExtractor::Extract(
       if (cache[mit->second].box.IsOut(cache[di].box))
         continue;
 
+      double pair_fuzzy =
+          AdaptiveFuzzy(cache[mit->second].size, cache[di].size, fuzzy_mm);
+
       // faces of the daughter that lie flush against the mother's
       // OUTER wall (the daughter touches M's boundary from inside).
       // There M has zero thickness: the surface there is really
       // daughter↔(whatever borders M), not mother↔daughter.
       TopoDS_Shape flush = FindSharedFacesCached(
           cache[mit->second].faces, cache[mit->second].faceBox, cache[di].faces,
-          cache[di].faceBox, fuzzy_mm, kAreaFloor);
+          cache[di].faceBox, pair_fuzzy, kAreaFloor);
       bool has_flush = HasRealSurface(flush, kAreaFloor);
 
       // re-attribute M's outward surface under the flush
       // footprint to the daughter. Done BEFORE emitting M↔D so the
       // freshly-created M↔D is not itself a steal target.
-      if (has_flush)
+      if (has_flush) {
+#pragma omp critical(iface_extract)
         steal_for(daughter, mother, flush);
+      }
 
       // For a daughter fully contained in the mother, the interface
       // is the daughter's outer surface — no boolean needed.
@@ -768,14 +1030,14 @@ void InterfaceExtractor::Extract(
         Bnd_Box motherBox, daughterBox;
         BRepBndLib::Add(mother.shape, motherBox);
         BRepBndLib::Add(daughter.shape, daughterBox);
-        motherBox.Enlarge(fuzzy_mm);
+        motherBox.Enlarge(pair_fuzzy);
         if (!motherBox.IsOut(daughterBox)) {
           // Daughter fully inside mother — daughter surface IS the interface
           result = daughter.shape;
         } else {
           // Partial overlap — try boolean
           BRepAlgoAPI_Common common(mother.shape, daughter.shape);
-          common.SetFuzzyValue(fuzzy_mm);
+          common.SetFuzzyValue(pair_fuzzy);
           common.Build();
           if (!common.IsDone())
             continue;
@@ -793,6 +1055,10 @@ void InterfaceExtractor::Extract(
       //   - regions shared with touching siblings
       //   - faces flush with the mother's outer wall, which
       //     carry no mother material and were re-attributed above
+      //
+      // shared_per_daughter is read-only from here on — phase (1)
+      // above has already fully completed (parallel for's implicit
+      // barrier), so no lock needed for this lookup.
       std::vector<TopoDS_Shape> patches;
       auto pit = shared_per_daughter.find(daughter.id);
       if (pit != shared_per_daughter.end())
@@ -800,15 +1066,19 @@ void InterfaceExtractor::Extract(
       if (has_flush)
         patches.push_back(flush);
 
+      // iface_id here is only ever used for a printed warning label;
+      // assembly.interfaces.size() would race against emit()'s
+      // push_back under parallel execution, so use the daughter's own
+      // (immutable, already-assigned) volume id instead.
       bool warned = false;
-      TopoDS_Shape boundary =
-          SubtractPatches(result, patches, fuzzy_mm, kAreaFloor,
-                          (int)assembly.interfaces.size(), warned);
+      TopoDS_Shape boundary = SubtractPatches(
+          result, patches, pair_fuzzy, kAreaFloor, (int)daughter.id, warned);
 
       if (!HasRealSurface(boundary, kAreaFloor))
         continue; // whole surface shared away with siblings / flush
 
       if (mother_det) {
+#pragma omp critical(iface_extract)
         std::cout << "  [WARN] mother volume " << mother.name
                   << " is an optical detector but forced to lv_outside\n";
       }
@@ -816,17 +1086,36 @@ void InterfaceExtractor::Extract(
       OrientResult orient = OrientInterfaceForced(boundary, daughter, mother);
 
       // daughter passed as A so the detector channel resolves to it
+#pragma omp critical(iface_extract)
       emit(daughter, mother, orient, is_det(daughter), mother_det);
     }
   }
 
   // --------------------------------------------------------
+  // deterministic ordering: sibling pairs and daughters above are
+  // now processed in parallel (schedule(dynamic)), so the ORDER
+  // interfaces get emit()-ed in — and hence their ids, previously
+  // assigned purely by emission order — is no longer reproducible
+  // run-to-run. Sort by the (volumeA, volumeB) id pair (volume ids
+  // themselves come from AssemblyBuilder's single-threaded,
+  // deterministic traversal, so this key is always reproducible)
+  // before any id gets assigned below.
+  // --------------------------------------------------------
+
+  std::sort(assembly.interfaces.begin(), assembly.interfaces.end(),
+            [](const OpticalInterface &x, const OpticalInterface &y) {
+              auto key = [](const OpticalInterface &i) {
+                return std::minmax(i.volumeA, i.volumeB);
+              };
+              return key(x) < key(y);
+            });
+
+  // --------------------------------------------------------
   // compaction: a mother↔X interface whose region was FULLY
   // re-attributed to a flush daughter is left with an empty
   // boundary. Drop such interfaces and renumber ids 0..N-1 in
-  // emission order (SurfaceMesher/WriteInterfacesJSON key the
-  // STL filename off iface.id). When nothing was fully stolen
-  // this is a no-op and ids are unchanged.
+  // the now-deterministic order above (SurfaceMesher/
+  // WriteInterfacesJSON key the STL filename off iface.id).
   // --------------------------------------------------------
 
   {

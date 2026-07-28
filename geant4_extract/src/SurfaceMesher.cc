@@ -142,6 +142,12 @@ void SurfaceMesher::MeshInterfaces(
 
   const int n = static_cast<int>(assembly.interfaces.size());
 
+  // Written incrementally after each interface completes (see below) so
+  // metadata/interfaces.json can be polled mid-run to see audit stats for
+  // interfaces finished so far, instead of only appearing once the whole
+  // (potentially very long) meshing pass is done.
+  InterfaceExtractor extractor;
+
 #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < n; ++i) {
 
@@ -317,6 +323,13 @@ void SurfaceMesher::MeshInterfaces(
                   << (iface.mesh_empty ? " (EMPTY MESH)" : "") << "\n";
       }
       std::cout << std::endl;
+
+      // stream progress: rewrite interfaces.json now, not just at the end,
+      // so it can be polled mid-run. Serialized by this same critical
+      // section (concurrent writers to the same file would corrupt it);
+      // reading other threads' not-yet-finished entries mid-update is a
+      // harmless, self-correcting race for this progress-only purpose.
+      extractor.WriteInterfacesJSON(assembly, ".");
     }
   }
 
@@ -343,10 +356,9 @@ void SurfaceMesher::MeshInterfaces(
     }
   }
 
-  // --------------------------------------------------------
-  // write interfaces.json now that all stats are populated
-  // --------------------------------------------------------
-
-  InterfaceExtractor extractor;
+  // final rewrite: every interface's stats are now populated (the
+  // incremental writes above already kept interfaces.json current
+  // throughout, this just guarantees the very last one reflects all of
+  // them together).
   extractor.WriteInterfacesJSON(assembly, ".");
 }

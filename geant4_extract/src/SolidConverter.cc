@@ -40,6 +40,9 @@
 
 #include <BRep_Builder.hxx>
 
+#include <ShapeFix_Shell.hxx>
+#include <ShapeFix_Solid.hxx>
+
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
@@ -79,6 +82,46 @@ static gp_Trsf BuildTransform(const G4RotationMatrix &rot,
 }
 
 // ============================================================
+// RepairAndSolidify — orient-fix a shell, then promote it to a
+// genuine TopoDS_Solid.
+//
+// A source tessellated solid can have inconsistently-wound facets
+// (G4's own "negative cubic volume, please check orientation of
+// facets!" warning) — some facets face outward, some inward. Sewing
+// alone does not fix this: BRepAlgoAPI_Fuse/Cut/Common run against
+// an inconsistently-oriented shell/solid lose track of "inside vs
+// outside" and can produce chaotic self-intersecting garbage (this
+// is what turned DynodeSupportStructure into a triangle soup).
+// ShapeFix_Shell re-orients a shell's faces to be mutually
+// consistent; ShapeFix_Solid::SolidFromShell then builds a properly
+// oriented solid from that (and can bridge small gaps). Falls back
+// to the orientation-fixed shell, or the original shape, if either
+// step doesn't produce a solid — never worse than before.
+// ============================================================
+
+static TopoDS_Shape RepairAndSolidify(const TopoDS_Shape &s) {
+  if (s.ShapeType() != TopAbs_SHELL)
+    return s;
+
+  TopoDS_Shell shell = TopoDS::Shell(s);
+
+  Handle(ShapeFix_Shell) shellFix = new ShapeFix_Shell();
+  shellFix->Init(shell);
+  shellFix->Perform();
+  TopoDS_Shape fixed = shellFix->Shell();
+
+  if (fixed.ShapeType() != TopAbs_SHELL)
+    return fixed;
+
+  Handle(ShapeFix_Solid) solidFix = new ShapeFix_Solid();
+  TopoDS_Shape solid = solidFix->SolidFromShell(TopoDS::Shell(fixed));
+  if (!solid.IsNull() && solid.ShapeType() == TopAbs_SOLID)
+    return solid;
+
+  return fixed;
+}
+
+// ============================================================
 // FinishSewn — promote a sewn shell to a genuine TopoDS_Solid.
 //
 // BRepBuilderAPI_Sewing::SewedShape() only ever returns a bare
@@ -89,10 +132,11 @@ static gp_Trsf BuildTransform(const G4RotationMatrix &rot,
 // a much more fragile regime and a plausible source of the small
 // unsewn/mismatched edges that showed up as open/non-manifold
 // edges in meshed interfaces (e.g. G4Ellipsoid-derived solids
-// unioned with tubes). Wrapping each closed shell in
-// BRepBuilderAPI_MakeSolid gives later booleans a real solid to
-// work with; a shell that fails to close falls back to itself
-// unchanged (never worse than before).
+// unioned with tubes). Wrapping each closed shell in a properly
+// oriented solid (see RepairAndSolidify) gives later booleans a
+// real, consistently-oriented solid to work with; a shell that
+// can't be repaired falls back to itself unchanged (never worse
+// than before).
 // ============================================================
 
 static TopoDS_Shape FinishSewn(BRepBuilderAPI_Sewing &sew) {
@@ -100,12 +144,7 @@ static TopoDS_Shape FinishSewn(BRepBuilderAPI_Sewing &sew) {
   TopoDS_Shape sewed = sew.SewedShape();
 
   auto to_solid = [](const TopoDS_Shape &s) -> TopoDS_Shape {
-    if (s.ShapeType() != TopAbs_SHELL)
-      return s;
-    BRepBuilderAPI_MakeSolid mk(TopoDS::Shell(s));
-    if (!mk.IsDone())
-      return s;
-    return mk.Solid();
+    return RepairAndSolidify(s);
   };
 
   if (sewed.ShapeType() == TopAbs_SHELL)
