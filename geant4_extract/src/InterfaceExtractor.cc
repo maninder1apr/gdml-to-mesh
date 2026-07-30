@@ -774,6 +774,17 @@ void InterfaceExtractor::Extract(
   // naturally for flush grand-daughters.
   // --------------------------------------------------------
 
+  // Patches stolen from an M↔X interface, accumulated across ALL of M's
+  // flush daughters within one mother_id iteration, applied in one
+  // combined SubtractPatches call after that iteration's daughters loop
+  // (see below) instead of one sequential call per daughter. Sequentially
+  // re-cutting the SAME (already-modified) boundary once per stealing
+  // daughter compounds the per-facet-cut classification error each time;
+  // batching lets SubtractPatches classify every facet against ALL
+  // stolen patches at once, matching how the main containment path
+  // already batches shared_per_daughter + flush together.
+  std::unordered_map<int, std::vector<TopoDS_Shape>> pending_steals;
+
   auto steal_for = [&](const VolumeInstance &D, const VolumeInstance &M,
                        const TopoDS_Shape &flush, double pair_fuzzy,
                        uint64_t skip_emit_for_id = VolumeInstance::kNoMother) {
@@ -799,24 +810,20 @@ void InterfaceExtractor::Extract(
       if (X.mother_id == M.id)
         continue;
 
+      // Always read the ORIGINAL (not-yet-batched) boundary here, so
+      // every daughter stealing from this same M↔X interface computes
+      // its own `stolen` patch against the same consistent boundary,
+      // rather than one daughter's cut affecting the next's input.
       TopoDS_Shape I_boundary = assembly.interfaces[idx].boundary;
       TopoDS_Shape stolen =
           FindSharedFaces(flush, I_boundary, pair_fuzzy, kAreaFloor);
       if (!HasRealSurface(stolen, kAreaFloor))
         continue;
 
-      // (Fix 1) remove the stolen region from M↔X. Always needed
-      // regardless of whether D↔X also gets emitted below -- M's
-      // boundary genuinely no longer covers this footprint.
-      bool warned = false;
-      TopoDS_Shape shrunk = SubtractPatches(I_boundary, {stolen}, pair_fuzzy,
-                                            kAreaFloor, idx, warned);
-      assembly.interfaces[idx].boundary = shrunk; // idx valid; no realloc yet
-
-      if (!HasRealSurface(shrunk, kAreaFloor))
-        std::cout << "  [INFO] interface " << idx
-                  << " fully re-attributed to daughter " << D.name
-                  << " (mother no longer touches " << X.name << " here)\n";
+      // (Fix 1) accumulate the stolen region for M↔X; applied in one
+      // combined SubtractPatches call after this mother_id's daughters
+      // loop finishes (see below).
+      pending_steals[idx].push_back(stolen);
 
       // (Fix 3) emit D↔X for the stolen patch (sibling-style
       // orientation) -- UNLESS D is about to independently get its
@@ -1201,6 +1208,25 @@ void InterfaceExtractor::Extract(
 #pragma omp critical(iface_extract)
       emit(daughter, *iface_mother, orient, is_det(daughter), iface_mother_det);
     }
+
+    // Apply this mother_id's accumulated steals (see pending_steals
+    // above) in one combined SubtractPatches call per target interface,
+    // instead of the sequential per-daughter cuts steal_for used to do.
+    // Runs after the daughters loop above so every steal_for call this
+    // iteration has already contributed before any interface is cut.
+    for (auto &kv : pending_steals) {
+      int idx = kv.first;
+      TopoDS_Shape I_boundary = assembly.interfaces[idx].boundary;
+      bool warned = false;
+      TopoDS_Shape shrunk = SubtractPatches(I_boundary, kv.second, fuzzy_mm,
+                                            kAreaFloor, idx, warned);
+      assembly.interfaces[idx].boundary = shrunk;
+      if (!HasRealSurface(shrunk, kAreaFloor))
+        std::cout << "  [INFO] interface " << idx
+                  << " fully re-attributed to daughter(s) of mother_id="
+                  << mother_id << "\n";
+    }
+    pending_steals.clear();
   }
 
   // --------------------------------------------------------
