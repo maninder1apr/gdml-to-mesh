@@ -23,6 +23,7 @@ def cmd_run(args):
         rebuild=args.rebuild,
         verbose=args.verbose,
         jobs=args.jobs,
+        threads=args.threads,
     )
     print(result.summary())
 
@@ -69,7 +70,10 @@ def main():
     p_run.add_argument("--output-dir", default=None, help="Output directory (default: cwd)")
     p_run.add_argument("--rebuild", action="store_true", help="Force rebuild of C++ binary")
     p_run.add_argument("--verbose", action="store_true")
-    p_run.add_argument("--jobs", type=int, default=8)
+    p_run.add_argument("--jobs", type=int, default=8, help="Parallel build jobs (only used with --rebuild)")
+    p_run.add_argument("--threads", type=int, default=None,
+                        help="OpenMP thread count for the mesher run (default: all cores). "
+                             "Cap this to run multiple gdml-to-mesh jobs side by side without CPU contention.")
 
     # build
     p_build = sub.add_parser("build", help="Build the C++ binary")

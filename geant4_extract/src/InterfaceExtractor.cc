@@ -4,7 +4,6 @@
 #include <VolumeInstance.hh>
 
 #include <BRepAlgoAPI_Common.hxx>
-#include <BRepAlgoAPI_Cut.hxx>
 
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
@@ -437,6 +436,16 @@ static TopoDS_Shape ToFaceCompound(const TopoDS_Shape &s) {
 // that back into the small number of real, large flat faces the
 // algorithm actually expects. Falls back to the original shape if
 // unification fails — never worse than before.
+//
+// NOTE: relaxing SetLinearTolerance/SetAngularTolerance to merge
+// near-(but not exactly)-coplanar tessellation facets was tried and
+// made a known-broken case (PMTvacuum's remainder after two stolen
+// patches) measurably WORSE -- removed area dropped from 5667mm² to
+// 2837mm² out of a 6214mm² target, and it introduced non-manifold
+// edges/degenerate triangles that weren't there before. Reverted;
+// the per-facet-cut-on-faceted-geometry problem this was meant to
+// address is still open and needs a different approach (see
+// project memory / conversation history for the investigation).
 // ============================================================
 
 static TopoDS_Shape UnifyCoplanarFaces(const TopoDS_Shape &s) {
@@ -539,6 +548,13 @@ static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary_raw,
     }
   }
 
+  // NOTE: a "single whole-shape BRepAlgoAPI_Cut instead of the per-face
+  // loop below" attempt was tried and reverted -- it fails outright
+  // (IsDone()==false) on the specific case this file needs to fix
+  // (PMTvacuum's remainder after the photocathode-cap patch is
+  // subtracted), so it isn't a viable fix; the per-facet fragmentation
+  // problem documented below is still open.
+
   BRep_Builder builder;
   TopoDS_Compound out;
   builder.MakeCompound(out);
@@ -572,38 +588,43 @@ static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary_raw,
     BRepGProp::SurfaceProperties(f, fprops);
     double orig_area = fprops.Mass();
 
-    BRepAlgoAPI_Cut cut(f, local);
-    cut.SetFuzzyValue(fuzzy_mm);
-    cut.Build();
+    // Coverage-threshold decision instead of an exact per-facet Cut. This
+    // face `f` is one small flat piece of a tessellated (faceted, not
+    // analytic) boundary -- a curved surface like a PMT dome, an HPGe
+    // crystal, or a fiber is chopped into many such facets, each at a
+    // real angle to its neighbours. An exact Cut through the MIDDLE of
+    // one such facet (when the patch boundary doesn't align with the
+    // facet's own edges, which it usually doesn't) leaves a partially-
+    // cut sliver whose new edge doesn't match its neighbouring facets'
+    // edges -- confirmed root cause of severe fragmentation (mdom's
+    // VacuumTube|PMT_0, legend-200's HPGe<->pen) and of a genuine hang
+    // once several such patches must be subtracted from one shape
+    // (legend-200's fiber<->lar stall) -- see memory:
+    // project-legend200-fiber-lar-stall. Classifying the WHOLE facet as
+    // covered or not, by how much of its own area the patch overlaps,
+    // means a kept face is always untouched and its edges always match
+    // its neighbours exactly -- no partial cuts, so no slivers.
+    BRepAlgoAPI_Common overlap(f, local);
+    overlap.SetFuzzyValue(fuzzy_mm);
+    overlap.Build();
 
-    if (!cut.IsDone()) {
-      // fragile cut failed → keep whole face, warn (possible overlap)
-      builder.Add(out, f);
-      if (!warned) {
-        std::cout << "  [WARN] interface " << iface_id
-                  << ": coplanar Cut failed; keeping full "
-                  << "mother-daughter face (possible double coverage)\n";
-        warned = true;
-      }
-      continue;
+    double overlap_area = 0.0;
+    if (overlap.IsDone() && !overlap.Shape().IsNull()) {
+      GProp_GProps oprops;
+      BRepGProp::SurfaceProperties(overlap.Shape(), oprops);
+      overlap_area = oprops.Mass();
     }
 
-    TopoDS_Shape rem = cut.Shape();
-    if (rem.IsNull()) { // face fully shared with sibling → drop
+    if (overlap_area >= 0.5 * orig_area) {
+      // majority of this facet covered by a sibling/flush patch -> the
+      // whole facet belongs to the patch, drop it
       removed_area += orig_area;
       continue;
     }
 
-    GProp_GProps rprops;
-    BRepGProp::SurfaceProperties(rem, rprops);
-    double rem_area = rprops.Mass();
-
-    removed_area += (orig_area - rem_area);
-
-    if (rem_area <= area_floor_mm2)
-      continue; // fully shared → drop
-
-    builder.Add(out, rem);
+    // minority (or no) overlap -> keep the facet whole, unmodified
+    removed_area += overlap_area;
+    builder.Add(out, f);
   }
 
   // aggregate sanity check: every shared patch should have been removed
@@ -624,7 +645,14 @@ static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary_raw,
     warned = true;
   }
 
-  return out;
+  // Each per-face Cut above operates independently, so a remainder that
+  // should read as one connected region (e.g. an annular strip left after
+  // cutting a cap out of a dome) can come out as many small same-domain
+  // fragments -- especially after repeated sequential shrinks of the same
+  // interface (steal_for calls this once per stealing daughter). Merge
+  // them back down before returning; falls back to the un-merged compound
+  // if unification fails, never worse than before.
+  return UnifyCoplanarFaces(out);
 }
 
 // ============================================================
@@ -747,7 +775,8 @@ void InterfaceExtractor::Extract(
   // --------------------------------------------------------
 
   auto steal_for = [&](const VolumeInstance &D, const VolumeInstance &M,
-                       const TopoDS_Shape &flush) {
+                       const TopoDS_Shape &flush, double pair_fuzzy,
+                       uint64_t skip_emit_for_id = VolumeInstance::kNoMother) {
     auto it = interfaces_of_volume.find(M.id);
     if (it == interfaces_of_volume.end())
       return;
@@ -772,13 +801,15 @@ void InterfaceExtractor::Extract(
 
       TopoDS_Shape I_boundary = assembly.interfaces[idx].boundary;
       TopoDS_Shape stolen =
-          FindSharedFaces(flush, I_boundary, fuzzy_mm, kAreaFloor);
+          FindSharedFaces(flush, I_boundary, pair_fuzzy, kAreaFloor);
       if (!HasRealSurface(stolen, kAreaFloor))
         continue;
 
-      // (Fix 1) remove the stolen region from M↔X
+      // (Fix 1) remove the stolen region from M↔X. Always needed
+      // regardless of whether D↔X also gets emitted below -- M's
+      // boundary genuinely no longer covers this footprint.
       bool warned = false;
-      TopoDS_Shape shrunk = SubtractPatches(I_boundary, {stolen}, fuzzy_mm,
+      TopoDS_Shape shrunk = SubtractPatches(I_boundary, {stolen}, pair_fuzzy,
                                             kAreaFloor, idx, warned);
       assembly.interfaces[idx].boundary = shrunk; // idx valid; no realloc yet
 
@@ -787,7 +818,17 @@ void InterfaceExtractor::Extract(
                   << " fully re-attributed to daughter " << D.name
                   << " (mother no longer touches " << X.name << " here)\n";
 
-      // (Fix 3) emit D↔X for the stolen patch (sibling-style orientation)
+      // (Fix 3) emit D↔X for the stolen patch (sibling-style
+      // orientation) -- UNLESS D is about to independently get its
+      // own proper containment interface against this exact X via
+      // the same-material ancestor walk in the caller (a real
+      // BRepAlgoAPI_Common/contained-shape computation). That one is
+      // higher-fidelity than this rough flush∩old-boundary
+      // approximation, so skip the duplicate here rather than
+      // emitting two interfaces for the same physical pair.
+      if (X.id == skip_emit_for_id)
+        continue;
+
       bool D_det = is_det(D);
       bool X_det = is_det(X);
       OrientResult o = OrientInterfaceClassifier(stolen, D, X, D_det, X_det);
@@ -872,25 +913,49 @@ void InterfaceExtractor::Extract(
 
     std::vector<std::pair<size_t, size_t>> sibling_pairs;
     if (daughters.size() > 1) {
-      std::vector<double> sorted_sizes;
-      sorted_sizes.reserve(daughters.size());
-      for (size_t d : daughters)
-        sorted_sizes.push_back(cache[d].size);
-      std::sort(sorted_sizes.begin(), sorted_sizes.end());
-      double cell = sorted_sizes[sorted_sizes.size() / 2];
-      if (!(cell > 0.0))
-        cell = 1.0; // guard against a degenerate/zero-size group
+      // Per-AXIS cell size (median extent along that axis specifically),
+      // not one uniform cube size from the median bbox DIAGONAL. A long,
+      // thin shape (e.g. a fiber routed through LAr) has a diagonal
+      // dominated by its length, so a single scalar cell derived from
+      // that would either be too coarse for its thin cross-section axes
+      // or too fine for its long axis -- and when a whole group is
+      // mostly such elongated shapes (confirmed: legend-200's ~196
+      // fibers under "lar"), that mismatch can make a shape's bbox span
+      // a very large number of cells on its long axis, blowing up the
+      // number of candidate pairs generated instead of pruning them.
+      // Sizing each axis independently means a fiber gets a fine cell
+      // on its thin axes and an appropriately coarse one on its long
+      // axis, keeping its own cell-span bounded on every axis.
+      std::vector<double> dxs, dys, dzs;
+      dxs.reserve(daughters.size());
+      dys.reserve(daughters.size());
+      dzs.reserve(daughters.size());
+      for (size_t d : daughters) {
+        double xmin, ymin, zmin, xmax, ymax, zmax;
+        cache[d].box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
+        dxs.push_back(xmax - xmin);
+        dys.push_back(ymax - ymin);
+        dzs.push_back(zmax - zmin);
+      }
+      auto median_of = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+      };
+      double cellx = median_of(dxs), celly = median_of(dys), cellz = median_of(dzs);
+      if (!(cellx > 0.0)) cellx = 1.0;
+      if (!(celly > 0.0)) celly = 1.0;
+      if (!(cellz > 0.0)) cellz = 1.0;
 
       std::unordered_map<GridKey, std::vector<size_t>, GridKeyHash> grid;
       for (size_t a = 0; a < daughters.size(); ++a) {
         double xmin, ymin, zmin, xmax, ymax, zmax;
         cache[daughters[a]].box.Get(xmin, ymin, zmin, xmax, ymax, zmax);
-        long long ixmin = (long long)std::floor(xmin / cell);
-        long long ixmax = (long long)std::floor(xmax / cell);
-        long long iymin = (long long)std::floor(ymin / cell);
-        long long iymax = (long long)std::floor(ymax / cell);
-        long long izmin = (long long)std::floor(zmin / cell);
-        long long izmax = (long long)std::floor(zmax / cell);
+        long long ixmin = (long long)std::floor(xmin / cellx);
+        long long ixmax = (long long)std::floor(xmax / cellx);
+        long long iymin = (long long)std::floor(ymin / celly);
+        long long iymax = (long long)std::floor(ymax / celly);
+        long long izmin = (long long)std::floor(zmin / cellz);
+        long long izmax = (long long)std::floor(zmax / cellz);
         for (long long ix = ixmin; ix <= ixmax; ++ix)
           for (long long iy = iymin; iy <= iymax; ++iy)
             for (long long iz = izmin; iz <= izmax; ++iz)
@@ -911,6 +976,7 @@ void InterfaceExtractor::Extract(
           }
         }
       }
+
     }
 
 #pragma omp parallel for schedule(dynamic)
@@ -979,7 +1045,6 @@ void InterfaceExtractor::Extract(
     if (mit == id_to_index.end())
       continue;
     const VolumeInstance &mother = volumes[mit->second];
-    bool mother_det = is_det(mother);
 
     // Each daughter's flush/boolean/subtract work is independent and
     // often the most expensive part of this loop; parallelized the
@@ -992,32 +1057,70 @@ void InterfaceExtractor::Extract(
       size_t di = daughters[dpos];
       const VolumeInstance &daughter = volumes[di];
 
-      // Skip identical materials
-      if (mother.material == daughter.material)
-        continue;
-
       if (cache[mit->second].box.IsOut(cache[di].box))
         continue;
 
-      double pair_fuzzy =
+      // Same-material nested regions have no real optical boundary
+      // against their own immediate mother (no refractive-index
+      // change) — but the daughter can still genuinely touch a
+      // MATERIAL-DIFFERENT ancestor further up. Concrete case: a
+      // PMT's PhotocathodeRegionVacuum is nested inside a same-
+      // material PMTvacuum, but its curved cap is actually coincident
+      // with the glass two levels up (OMSim wires a
+      // G4LogicalBorderSurface directly between them for exactly
+      // this reason). Walk up the ancestor chain to the nearest
+      // material-different ancestor instead of unconditionally
+      // skipping the pair. Resolved BEFORE the flush/steal_for check
+      // below so steal_for can avoid double-emitting this same pair.
+      const VolumeInstance *iface_mother = &mother;
+      size_t iface_mother_idx = mit->second;
+      while (iface_mother->material == daughter.material) {
+        if (iface_mother->mother_id == VolumeInstance::kNoMother) {
+          iface_mother = nullptr;
+          break;
+        }
+        auto ancestor_it = id_to_index.find(iface_mother->mother_id);
+        if (ancestor_it == id_to_index.end()) {
+          iface_mother = nullptr;
+          break;
+        }
+        iface_mother_idx = ancestor_it->second;
+        iface_mother = &volumes[iface_mother_idx];
+      }
+
+      double flush_fuzzy =
           AdaptiveFuzzy(cache[mit->second].size, cache[di].size, fuzzy_mm);
 
       // faces of the daughter that lie flush against the mother's
       // OUTER wall (the daughter touches M's boundary from inside).
       // There M has zero thickness: the surface there is really
-      // daughter↔(whatever borders M), not mother↔daughter.
+      // daughter↔(whatever borders M), not mother↔daughter. Purely
+      // geometric, against the TRUE immediate mother — runs
+      // regardless of the same-material ancestor walk above.
       TopoDS_Shape flush = FindSharedFacesCached(
           cache[mit->second].faces, cache[mit->second].faceBox, cache[di].faces,
-          cache[di].faceBox, pair_fuzzy, kAreaFloor);
+          cache[di].faceBox, flush_fuzzy, kAreaFloor);
       bool has_flush = HasRealSurface(flush, kAreaFloor);
 
       // re-attribute M's outward surface under the flush
       // footprint to the daughter. Done BEFORE emitting M↔D so the
-      // freshly-created M↔D is not itself a steal target.
+      // freshly-created M↔D is not itself a steal target. Pass the
+      // resolved ancestor (if any) so steal_for skips re-emitting the
+      // same pair its own rough approximation would otherwise
+      // duplicate against the proper containment interface below.
       if (has_flush) {
+        uint64_t skip_id = iface_mother ? iface_mother->id
+                                         : VolumeInstance::kNoMother;
 #pragma omp critical(iface_extract)
-        steal_for(daughter, mother, flush);
+        steal_for(daughter, mother, flush, flush_fuzzy, skip_id);
       }
+
+      if (!iface_mother)
+        continue;
+      bool iface_mother_det = is_det(*iface_mother);
+
+      double pair_fuzzy =
+          AdaptiveFuzzy(cache[iface_mother_idx].size, cache[di].size, fuzzy_mm);
 
       // For a daughter fully contained in the mother, the interface
       // is the daughter's outer surface — no boolean needed.
@@ -1028,7 +1131,7 @@ void InterfaceExtractor::Extract(
       // Try fast path: use daughter shape directly if bbox is contained
       {
         Bnd_Box motherBox, daughterBox;
-        BRepBndLib::Add(mother.shape, motherBox);
+        BRepBndLib::Add(iface_mother->shape, motherBox);
         BRepBndLib::Add(daughter.shape, daughterBox);
         motherBox.Enlarge(pair_fuzzy);
         if (!motherBox.IsOut(daughterBox)) {
@@ -1036,7 +1139,7 @@ void InterfaceExtractor::Extract(
           result = daughter.shape;
         } else {
           // Partial overlap — try boolean
-          BRepAlgoAPI_Common common(mother.shape, daughter.shape);
+          BRepAlgoAPI_Common common(iface_mother->shape, daughter.shape);
           common.SetFuzzyValue(pair_fuzzy);
           common.Build();
           if (!common.IsDone())
@@ -1051,10 +1154,8 @@ void InterfaceExtractor::Extract(
       if (!HasRealSurface(result, kAreaFloor))
         continue;
 
-      // patches to cut out of M↔D (no double coverage):
-      //   - regions shared with touching siblings
-      //   - faces flush with the mother's outer wall, which
-      //     carry no mother material and were re-attributed above
+      // patches to cut out of the D↔iface_mother boundary (no double
+      // coverage): regions shared with touching siblings.
       //
       // shared_per_daughter is read-only from here on — phase (1)
       // above has already fully completed (parallel for's implicit
@@ -1063,7 +1164,17 @@ void InterfaceExtractor::Extract(
       auto pit = shared_per_daughter.find(daughter.id);
       if (pit != shared_per_daughter.end())
         patches = pit->second;
-      if (has_flush)
+
+      // The flush footprint (D's overlap with M's OUTER wall) only
+      // belongs to someone else's interface -- and so only needs
+      // cutting out here -- when M itself is the real interface
+      // partner (iface_mother == &mother). When the ancestor walk
+      // above went PAST M (M was same-material), that same flush
+      // footprint IS D's real contact with iface_mother (that
+      // coincidence is exactly what let steal_for() steal it from
+      // M's own outward interface); subtracting it here would erase
+      // the very region this interface is supposed to keep.
+      if (has_flush && iface_mother == &mother)
         patches.push_back(flush);
 
       // iface_id here is only ever used for a printed warning label;
@@ -1077,17 +1188,18 @@ void InterfaceExtractor::Extract(
       if (!HasRealSurface(boundary, kAreaFloor))
         continue; // whole surface shared away with siblings / flush
 
-      if (mother_det) {
+      if (iface_mother_det) {
 #pragma omp critical(iface_extract)
-        std::cout << "  [WARN] mother volume " << mother.name
+        std::cout << "  [WARN] mother volume " << iface_mother->name
                   << " is an optical detector but forced to lv_outside\n";
       }
 
-      OrientResult orient = OrientInterfaceForced(boundary, daughter, mother);
+      OrientResult orient =
+          OrientInterfaceForced(boundary, daughter, *iface_mother);
 
       // daughter passed as A so the detector channel resolves to it
 #pragma omp critical(iface_extract)
-      emit(daughter, mother, orient, is_det(daughter), mother_det);
+      emit(daughter, *iface_mother, orient, is_det(daughter), iface_mother_det);
     }
   }
 

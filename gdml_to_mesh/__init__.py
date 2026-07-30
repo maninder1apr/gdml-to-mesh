@@ -73,6 +73,7 @@ def run(
     rebuild: bool = False,
     verbose: bool = False,
     jobs: int = 8,
+    threads: Optional[int] = None,
 ) -> GeometryResult:
     """
     Run the occ_mesher on a GDML file and return a GeometryResult.
@@ -83,7 +84,11 @@ def run(
     output_dir  : where to write cad/ and metadata/ (default: cwd)
     rebuild     : force rebuild of the C++ binary
     verbose     : show cmake/make output
-    jobs        : parallel build jobs
+    jobs        : parallel build jobs (only used when rebuild=True)
+    threads     : OpenMP thread count for the mesher run itself (default:
+                  all available cores). Cap this to let multiple
+                  gdml-to-mesh runs coexist without starving each other
+                  for CPU.
 
     Returns
     -------
@@ -104,12 +109,18 @@ def run(
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # run the mesher
-    print(f"gdml-to-mesh: running on {gdml_path.name}...")
+    env = os.environ.copy()
+    if threads is not None:
+        env["OMP_NUM_THREADS"] = str(threads)
+
+    print(f"gdml-to-mesh: running on {gdml_path.name}..."
+          + (f" (OMP_NUM_THREADS={threads})" if threads is not None else ""))
     result = subprocess.run(
         [str(binary), str(gdml_path)],
         cwd=str(work_dir),
         capture_output=not verbose,
         text=True,
+        env=env,
     )
 
     if result.returncode != 0:

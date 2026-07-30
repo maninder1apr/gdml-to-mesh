@@ -145,6 +145,18 @@ void AssemblyBuilder::Traverse(
     static const std::set<std::string> kSkipNames = {
         "SupportStructure_physical",
         "TubeHolder_logical",
+        // fiber<->lar interface extraction reproducibly stalls (burns CPU,
+        // zero progress for several minutes+). Root cause found: same
+        // per-facet Boolean Cut fragility as mdom's VacuumTube|PMT_0 and
+        // legend-200's HPGe<->pen interfaces -- once a fiber accumulates
+        // multiple sibling-contact patches (from a genuinely slow but
+        // completing sibling-pair phase among ~20 spatially-clustered
+        // bend segments), cutting those patches out of its own faceted
+        // surface against lar hangs instead of just fragmenting. Fixing
+        // SubtractPatches properly would likely resolve all three at
+        // once. Skip fibers for now so the rest of legend-200 completes;
+        // revisit separately (see memory: project-legend200-fiber-lar-stall).
+        "fiber",
     };
     bool skip_this = false;
     for (const auto& s : kSkipNames) {
@@ -162,13 +174,31 @@ void AssemblyBuilder::Traverse(
         if (solid) {
 
             // ------------------------------------------------
-            // convert solid
+            // convert solid (cached by G4VSolid pointer -- GDML
+            // reuses one <volume> definition across many placements
+            // via <physvolref>/<volumeref>, e.g. all 24 mDOM PMTs
+            // share the identical solid per part. Converting once
+            // per unique pointer instead of once per placement skips
+            // the repeated tessellation/sewing/RepairAndSolidify
+            // cost, which was the actual bottleneck in placement.
             // ------------------------------------------------
 
-            SolidConverter converter;
+            TopoDS_Shape shape;
 
-            TopoDS_Shape shape =
-                converter.Convert(solid);
+            auto cached = solid_cache_.find(solid);
+
+            if (cached != solid_cache_.end()) {
+
+                shape = cached->second;
+            }
+            else {
+
+                SolidConverter converter;
+
+                shape = converter.Convert(solid);
+
+                solid_cache_[solid] = shape;
+            }
 
             if (!shape.IsNull()) {
 
