@@ -481,8 +481,13 @@ TopoDS_Shape SolidConverter::ConvertGenericPolycone(G4GenericPolycone *solid) {
                                    gp_Pnt(p2g.r / mm, 0.0, p2g.z / mm)));
   }
 
+  double sphi = solid->GetStartPhi();
+  double dphi = solid->GetEndPhi() - sphi;
+  constexpr double kTwoPi = 2.0 * 3.14159265358979323846;
+  bool full = (dphi >= kTwoPi - 1e-9);
+
   gp_Ax1 axis(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1));
-  return BRepPrimAPI_MakeRevol(wb.Wire(), axis, 2.0 * M_PI);
+  return BRepPrimAPI_MakeRevol(wb.Wire(), axis, full ? kTwoPi : dphi);
 }
 
 // ============================================================

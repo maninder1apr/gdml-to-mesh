@@ -31,7 +31,14 @@
 
 #include <ShapeUpgrade_UnifySameDomain.hxx>
 
+#include <Geom_Plane.hxx>
+#include <Geom_Surface.hxx>
+#include <GeomAPI_ProjectPointOnSurf.hxx>
+
+#include <TopoDS_Vertex.hxx>
+
 #include <gp_Dir.hxx>
+#include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 
 #include <nlohmann/json.hpp>
@@ -296,6 +303,93 @@ struct GridKeyHash {
 };
 
 // ============================================================
+// FacesMayTouch — cheap pre-filter before an expensive per-face
+// BRepAlgoAPI_Common, in two tiers:
+//
+//   1. BOTH faces planar (O(1), exact): every face
+//      SolidConverter::ConvertViaPolyhedron produces (G4Polyhedron-
+//      tessellated solids -- PMT domes, HPGe crystals, and
+//      critically the ~200-point genericPolycone-derived fiber bend
+//      segments) is built via BRepBuilderAPI_MakePolygon +
+//      BRepBuilderAPI_MakeFace, i.e. a genuine flat Geom_Plane, never
+//      a curved analytic surface. Two non-coplanar planes cannot
+//      share a real coincident patch no matter their position, so
+//      comparing plane normal + offset directly (a couple of dot
+//      products) rules them out exactly. Confirmed the dominant cost
+//      for bend-fiber-vs-bend-fiber sibling checks (~15-28s each) was
+//      exactly this per-pair Common call (see memory:
+//      project-legend200-fiber-lar-stall).
+//
+//   2. ONE planar + one curved analytic (approximate, sample-based):
+//      e.g. a fiber's flat facet against "lar" (a G4UnionSolid,
+//      converted via a real BRepAlgoAPI_Fuse of its analytic
+//      constituents -- ConvertUnion -- so its faces stay genuine
+//      cylinders/cones, never flattened). Tier 1 can't shortcut this
+//      combination at all (it requires BOTH sides planar), which is
+//      exactly why it didn't help the fiber<->lar mother-daughter
+//      stall. Here, project the planar face's own vertices onto the
+//      curved surface (GeomAPI_ProjectPointOnSurf, a single-point
+//      projection against one known analytic surface -- NOT the
+//      whole-shape BRepExtrema_DistShapeShape search that was tried
+//      and made things worse) and rule the pair out only if every
+//      sampled vertex is farther than the fuzzy tolerance.
+//
+//   3. Neither/both curved: can't cheaply decide, fall through.
+//
+// Returns true ("can't cheaply rule out, do the real check") for
+// tier 3 and whenever tier 1/2 don't prove non-intersection, so this
+// never risks a false negative -- it only ever skips work it can
+// prove is unnecessary.
+// ============================================================
+
+static bool FacesMayTouch(const TopoDS_Face &fa, const TopoDS_Face &fb,
+                          double fuzzy_mm) {
+  Handle(Geom_Surface) sa = BRep_Tool::Surface(fa);
+  Handle(Geom_Surface) sb = BRep_Tool::Surface(fb);
+  Handle(Geom_Plane) pa = Handle(Geom_Plane)::DownCast(sa);
+  Handle(Geom_Plane) pb = Handle(Geom_Plane)::DownCast(sb);
+
+  if (!pa.IsNull() && !pb.IsNull()) {
+    // Tier 1: both planar -- exact plane-vs-plane comparison.
+    const gp_Dir &na = pa->Pln().Axis().Direction();
+    const gp_Dir &nb = pb->Pln().Axis().Direction();
+
+    // normals must be parallel or anti-parallel within a small angular
+    // tolerance (coplanar faces can be wound either direction depending
+    // on which solid "owns" them)
+    double dot = na.Dot(nb);
+    constexpr double kAngTol = 1e-3;
+    if (std::abs(std::abs(dot) - 1.0) > kAngTol)
+      return false;
+
+    // planes must sit at (nearly) the same offset along that normal
+    double dist = pb->Pln().Distance(pa->Pln().Location());
+    return dist <= fuzzy_mm;
+  }
+
+  if (pa.IsNull() == pb.IsNull())
+    return true; // both curved (or somehow both null) -- can't cheaply decide
+
+  // Tier 2: one planar, one curved -- sample the planar face's own
+  // vertices and check their distance to the curved surface directly.
+  const TopoDS_Face &planarFace = pa.IsNull() ? fb : fa;
+  const Handle(Geom_Surface) &curvedSurf = pa.IsNull() ? sa : sb;
+
+  bool sampled_any = false;
+  for (TopExp_Explorer ve(planarFace, TopAbs_VERTEX); ve.More(); ve.Next()) {
+    gp_Pnt p = BRep_Tool::Pnt(TopoDS::Vertex(ve.Current()));
+    GeomAPI_ProjectPointOnSurf proj(p, curvedSurf);
+    sampled_any = true;
+    if (proj.NbPoints() > 0 && proj.LowerDistance() <= fuzzy_mm)
+      return true; // at least one vertex close enough -- can't rule out
+  }
+
+  return !sampled_any; // no vertices found (shouldn't happen) -> don't
+                       // risk a false negative, fall through to the
+                       // real check instead of skipping blind
+}
+
+// ============================================================
 // FindSharedFaces — detect coincident faces between two solids.
 //
 // Iterates face pairs (bbox pre-filtered) and runs a 2D
@@ -336,6 +430,9 @@ static TopoDS_Shape FindSharedFaces(const TopoDS_Shape &solidA,
       if (boxA[a].IsOut(boxB[b]))
         continue; // face-level cull
 
+      if (!FacesMayTouch(facesA[a], facesB[b], fuzzy_mm))
+        continue; // geometry-level cull -- see FacesMayTouch
+
       BRepAlgoAPI_Common common(facesA[a], facesB[b]);
       common.SetFuzzyValue(fuzzy_mm);
       common.Build();
@@ -375,6 +472,9 @@ static TopoDS_Shape FindSharedFacesCached(
 
       if (boxA[a].IsOut(boxB[b]))
         continue; // face-level cull
+
+      if (!FacesMayTouch(facesA[a], facesB[b], fuzzy_mm))
+        continue; // geometry-level cull -- see FacesMayTouch
 
       BRepAlgoAPI_Common common(facesA[a], facesB[b]);
       common.SetFuzzyValue(fuzzy_mm);
