@@ -13,12 +13,16 @@
 
 #include <StlAPI_Writer.hxx>
 
+#include <BRep_Builder.hxx>
+#include <TopoDS_Compound.hxx>
+
 #include <Poly_Triangle.hxx>
 #include <Poly_Triangulation.hxx>
 #include <cmath>
 #include <gp_Pnt.hxx>
 #include <gp_Vec.hxx>
 #include <map>
+#include <string>
 #include <tuple>
 #include <unordered_map>
 
@@ -31,7 +35,9 @@
 
 #include <TopAbs_ShapeEnum.hxx>
 
+#include <chrono>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 
 #ifdef _OPENMP
@@ -107,6 +113,53 @@ EdgeKey MakeEdgeKey(const gp_Pnt &p, const gp_Pnt &q) {
   return {ax, ay, az, bx, by, bz};
 }
 
+// ============================================================
+// fiber-layer interface bundling
+//
+// A fiber system can produce thousands of individually-tiny interfaces
+// (every fiber's own core<->cl1, cl1<->cl2, ... contact), each of which
+// would otherwise get its own STL file -- LEGEND-1000 alone has ~12000
+// fiber placements. Every interface between the same pair of fiber-
+// layer materials shares ONE combined STL instead (accumulated across
+// threads into a per-pair compound, written once after the main loop);
+// each interface's own area/mesh-quality/pv names in interfaces.json
+// are completely unaffected, only iface.stl_override changes.
+// ============================================================
+
+bool IsFiberLayerMaterial(const std::string &mat) {
+  return mat == "tpb_on_fibers" || mat == "pmma_cl2" || mat == "pmma" ||
+         mat == "ps_fibers";
+}
+
+// single shared filename for every fiber-layer interface, regardless of
+// which specific material pair it is (core<->cl1, cl1<->cl2, ...)
+const std::string kFiberBundleStlPath = "cad/interfaces/interface_bundle_fiber.stl";
+
+// deterministic, order-independent grouping key for a material pair --
+// e.g. "pmma|pmma_cl2" regardless of which side was materialA/materialB,
+// so every instance of the same fiber LAYER PAIR (across however many
+// individual fibers) accumulates into one shared stats row.
+std::string MaterialPairKey(const std::string &matA, const std::string &matB) {
+  std::string a = matA, b = matB;
+  if (b < a)
+    std::swap(a, b);
+  return a + "|" + b;
+}
+
+// per-fiber-layer-pair timing + mesh-quality accumulator, populated in the
+// main meshing loop below and summarized once it's done -- lets a run
+// answer "which fiber layer pair is actually slow / actually broken?"
+// directly instead of guessing from thousands of individual log lines.
+struct FiberLayerStats {
+  int count = 0;
+  double total_ms = 0.0;
+  long open_edges = 0;
+  long nonmanifold_edges = 0;
+  long degenerate_tris = 0;
+  int mesh_empty = 0;
+  double total_area_mm2 = 0.0;
+};
+
 } // namespace
 
 // ============================================================
@@ -148,10 +201,25 @@ void SurfaceMesher::MeshInterfaces(
   // (potentially very long) meshing pass is done.
   InterfaceExtractor extractor;
 
+  // Accumulates every fiber-layer interface's boundary into ONE shared
+  // compound (see IsFiberLayerMaterial/kFiberBundleStlPath above), guarded
+  // by the same critical section used to build it below. Written out
+  // once, after the main loop, instead of per-interface.
+  TopoDS_Compound fiber_bundle;
+  BRep_Builder fiber_bundle_builder;
+  fiber_bundle_builder.MakeCompound(fiber_bundle);
+  bool has_fiber_bundle = false;
+
+  // per-fiber-layer-pair timing + mesh-quality breakdown (see
+  // FiberLayerStats/MaterialPairKey above) -- printed as a summary table
+  // once the main loop below is done.
+  std::map<std::string, FiberLayerStats> fiber_layer_stats;
+
 #pragma omp parallel for schedule(dynamic)
   for (int i = 0; i < n; ++i) {
 
     auto &iface = assembly.interfaces[i];
+    auto iface_t0 = std::chrono::steady_clock::now();
 
     // ----------------------------------------------------
     // verify boundary topology
@@ -208,10 +276,26 @@ void SurfaceMesher::MeshInterfaces(
     std::string stl_name =
         "cad/interfaces/interface_" + std::to_string(iface.id) + ".stl";
 
-    StlAPI_Writer stl_writer;
-    stl_writer.ASCIIMode() = Standard_False; // write binary STL
+    bool bundled = IsFiberLayerMaterial(iface.materialA) ||
+                   IsFiberLayerMaterial(iface.materialB);
 
-    stl_writer.Write(iface.boundary, stl_name.c_str());
+    if (bundled) {
+      // Accumulate into the ONE shared fiber compound instead of writing
+      // this interface's own file -- area/mesh-quality below are computed
+      // from iface.boundary's own triangulation regardless, so nothing
+      // about this interface's own metadata is affected.
+      stl_name = kFiberBundleStlPath;
+      iface.stl_override = stl_name;
+#pragma omp critical(fiber_bundle)
+      {
+        fiber_bundle_builder.Add(fiber_bundle, iface.boundary);
+        has_fiber_bundle = true;
+      }
+    } else {
+      StlAPI_Writer stl_writer;
+      stl_writer.ASCIIMode() = Standard_False; // write binary STL
+      stl_writer.Write(iface.boundary, stl_name.c_str());
+    }
 
     size_t total_vertices = 0;
     size_t total_triangles = 0;
@@ -299,6 +383,25 @@ void SurfaceMesher::MeshInterfaces(
     bool broken = iface.mesh_empty || open_edges > 0 || nonmanifold_edges > 0 ||
                  degenerate_tris > 0;
 
+    if (bundled) {
+      double elapsed_ms =
+          std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - iface_t0)
+              .count();
+      std::string key = MaterialPairKey(iface.materialA, iface.materialB);
+#pragma omp critical(fiber_layer_stats)
+      {
+        FiberLayerStats &s = fiber_layer_stats[key];
+        ++s.count;
+        s.total_ms += elapsed_ms;
+        s.open_edges += open_edges;
+        s.nonmanifold_edges += nonmanifold_edges;
+        s.degenerate_tris += degenerate_tris;
+        s.mesh_empty += iface.mesh_empty ? 1 : 0;
+        s.total_area_mm2 += area_mm2;
+      }
+    }
+
     // ----------------------------------------------------
     // report
     // ----------------------------------------------------
@@ -333,7 +436,46 @@ void SurfaceMesher::MeshInterfaces(
     }
   }
 
+  // Write the single accumulated fiber bundle exactly once, now that every
+  // interface has contributed its boundary above.
+  if (has_fiber_bundle) {
+    StlAPI_Writer stl_writer;
+    stl_writer.ASCIIMode() = Standard_False;
+    stl_writer.Write(fiber_bundle, kFiberBundleStlPath.c_str());
+    std::cout << "Wrote fiber-layer bundle: " << kFiberBundleStlPath << std::endl;
+  }
+
   std::cout << "Finished interface meshing.\n" << std::endl;
+
+  // --------------------------------------------------------
+  // per-fiber-layer-pair timing + mesh-quality breakdown
+  // --------------------------------------------------------
+
+  if (!fiber_layer_stats.empty()) {
+    std::cout << "Fiber-layer meshing breakdown (tessellation + quality "
+                 "audit time only, not interface discovery):\n";
+    std::cout << "  layer pair                            count   total_ms  "
+                 "avg_ms   open_edges  nonmanifold  degenerate  empty  "
+                 "total_area_mm2\n";
+    double grand_total_ms = 0.0;
+    int grand_total_count = 0;
+    for (const auto &kv : fiber_layer_stats) {
+      const FiberLayerStats &s = kv.second;
+      double avg_ms = s.count > 0 ? s.total_ms / s.count : 0.0;
+      std::cout << "  " << std::left << std::setw(38) << kv.first
+                << std::right << std::setw(6) << s.count << std::setw(11)
+                << std::fixed << std::setprecision(1) << s.total_ms
+                << std::setw(9) << avg_ms << std::setw(12) << s.open_edges
+                << std::setw(13) << s.nonmanifold_edges << std::setw(12)
+                << s.degenerate_tris << std::setw(7) << s.mesh_empty
+                << std::setw(16) << s.total_area_mm2 << "\n";
+      grand_total_ms += s.total_ms;
+      grand_total_count += s.count;
+    }
+    std::cout << "  TOTAL: " << grand_total_count << " fiber-layer interfaces, "
+              << grand_total_ms << " ms combined meshing time\n"
+              << std::endl;
+  }
 
   // --------------------------------------------------------
   // mesh-quality summary

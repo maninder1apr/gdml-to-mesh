@@ -477,9 +477,34 @@ TopoDS_Shape SolidConverter::ConvertGenericPolycone(G4GenericPolycone *solid) {
   for (int i = 0; i < n - 1; ++i) {
     auto p1g = solid->GetCorner(i);
     auto p2g = solid->GetCorner(i + 1);
-    wb.Add(BRepBuilderAPI_MakeEdge(gp_Pnt(p1g.r / mm, 0.0, p1g.z / mm),
-                                   gp_Pnt(p2g.r / mm, 0.0, p2g.z / mm)));
+    double r1 = p1g.r / mm, z1 = p1g.z / mm;
+    double r2 = p2g.r / mm, z2 = p2g.z / mm;
+
+    // Skip segments too short to be a meaningful edge. Seen in
+    // practice (legend-1000's outer cryostat profile): consecutive
+    // rz-points as little as 2 PICOMETERS apart -- far below OCC's own
+    // confusion tolerance (~1e-7mm), yet BRepBuilderAPI_MakeEdge still
+    // reports IsDone()==true for them (its own success check isn't a
+    // reliable filter here). Passing such a practically-zero-length
+    // edge into the wire doesn't fail until BRepSweep_Rotation
+    // processes it much later, deep inside BRepPrimAPI_MakeRevol
+    // (BRepAdaptor_Curve::Initialize throws Standard_NullObject there,
+    // far from the actual cause) -- so filter by distance explicitly,
+    // well above OCC's confusion tolerance, rather than trusting
+    // MakeEdge's own IsDone().
+    constexpr double kMinSegLen = 1e-6; // mm
+    if (std::hypot(r1 - r2, z1 - z2) < kMinSegLen)
+      continue;
+
+    BRepBuilderAPI_MakeEdge edgeMaker(gp_Pnt(r1, 0.0, z1),
+                                      gp_Pnt(r2, 0.0, z2));
+    if (!edgeMaker.IsDone())
+      continue;
+    wb.Add(edgeMaker.Edge());
   }
+
+  if (!wb.IsDone())
+    return TopoDS_Shape();
 
   double sphi = solid->GetStartPhi();
   double dphi = solid->GetEndPhi() - sphi;

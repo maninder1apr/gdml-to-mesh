@@ -4,6 +4,7 @@
 #include <VolumeInstance.hh>
 
 #include <BRepAlgoAPI_Common.hxx>
+#include <BRepAlgoAPI_Cut.hxx>
 
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
@@ -715,6 +716,44 @@ static TopoDS_Shape SubtractPatches(const TopoDS_Shape &boundary_raw,
       overlap_area = oprops.Mass();
     }
 
+    // A face this large has already been through UnifyCoplanarFaces --
+    // it is not one of the many tiny raw tessellation facets the
+    // keep-whole-or-drop-whole rule above was designed for, it's a
+    // single big clean piece (e.g. an entire merged bottom disc). The
+    // binary threshold badly misfires here: legend-200's pen_top<->lar
+    // had a face with orig_area=1265mm^2 genuinely overlapping a
+    // sibling (the HPGe crystal) by overlap_area=564mm^2 (44.6%) --
+    // just under the 50% cutoff, so the WHOLE face was kept untouched,
+    // silently double-counting that 564mm^2 in both interfaces. A real
+    // partial Cut is safe here specifically because there's exactly
+    // ONE face and ONE patch region involved, not hundreds of
+    // mismatched neighbours to fragment against.
+    constexpr double kLargeFaceFloor = 50.0; // mm^2
+    if (orig_area > kLargeFaceFloor && overlap_area > area_floor_mm2 &&
+        overlap_area < orig_area - area_floor_mm2) {
+      BRepAlgoAPI_Cut cut(f, local);
+      cut.SetFuzzyValue(fuzzy_mm);
+      cut.Build();
+      if (cut.IsDone() && !cut.Shape().IsNull()) {
+        TopoDS_Shape cutShape = cut.Shape();
+        if (HasRealSurface(cutShape, area_floor_mm2)) {
+          GProp_GProps cprops;
+          BRepGProp::SurfaceProperties(cutShape, cprops);
+          removed_area += (orig_area - cprops.Mass());
+          for (TopExp_Explorer ce(cutShape, TopAbs_FACE); ce.More();
+               ce.Next())
+            builder.Add(out, TopoDS::Face(ce.Current()));
+          continue;
+        }
+        // Cut succeeded but removed (near-)everything -- treat as fully
+        // covered rather than falling through to keep the whole face.
+        removed_area += orig_area;
+        continue;
+      }
+      // Cut failed -- fall through to the binary threshold below,
+      // never worse than the pre-existing behaviour.
+    }
+
     if (overlap_area >= 0.5 * orig_area) {
       // majority of this facet covered by a sibling/flush patch -> the
       // whole facet belongs to the patch, drop it
@@ -1393,8 +1432,10 @@ void InterfaceExtractor::WriteInterfacesJSON(const DetectorAssembly &assembly,
 
     json entry;
     entry["id"] = iface.id;
-    entry["stl"] =
-        "cad/interfaces/interface_" + std::to_string(iface.id) + ".stl";
+    entry["stl"] = iface.stl_override.empty()
+                       ? "cad/interfaces/interface_" +
+                             std::to_string(iface.id) + ".stl"
+                       : iface.stl_override;
     entry["pv_inside"] = iface.pv_inside;
     entry["pv_outside"] = iface.pv_outside;
     entry["lv_inside"] = iface.lv_inside;

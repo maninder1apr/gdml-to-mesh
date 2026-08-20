@@ -30,6 +30,15 @@ struct OpticalInterface {
   // normals point from pv_inside toward pv_outside
   TopoDS_Shape boundary;
 
+  // Non-empty only for interfaces bundled into a shared STL file (see
+  // SurfaceMesher's fiber-layer bundling): every instance of a given
+  // material pair (e.g. all core<->cl1 contacts across every fiber)
+  // shares ONE combined STL instead of one file each, since a fiber
+  // system can have thousands of individually-tiny interfaces. Each
+  // instance still keeps its own area/mesh-quality/pv names above --
+  // only the STL file is shared, nothing is merged away in the JSON.
+  std::string stl_override;
+
   // filled by SurfaceMesher
   int n_triangles = 0;
   double area_mm2 = 0.0; // now taken from the triangulation (see below)
