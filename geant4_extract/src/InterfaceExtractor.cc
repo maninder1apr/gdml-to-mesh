@@ -929,6 +929,17 @@ void InterfaceExtractor::Extract(
     const std::map<std::string, int> &optical_detectors, double fuzzy_mm) {
   auto &volumes = assembly.volumes;
 
+  // The mother-group loop below is about to become the outermost
+  // `#pragma omp parallel for` (parallelizing ACROSS groups, not just
+  // within one group's sibling/daughter loops -- see the comment above
+  // that loop). The existing inner `#pragma omp parallel for` regions
+  // stay in place unmodified; capping active nesting to 1 level makes
+  // them run as ordinary serial loops when reached from inside the new
+  // outer parallel region (the OpenMP-spec-guaranteed behavior, not a
+  // hopeful assumption), so the two never compound into thread
+  // oversubscription.
+  omp_set_max_active_levels(1);
+
   constexpr double kAreaFloor = 1e-6; // mm² — reject degenerate patches
 
   std::cout << "\nChecking interfaces (fuzzy = " << fuzzy_mm << " mm)...\n"
@@ -1055,10 +1066,13 @@ void InterfaceExtractor::Extract(
   // batching lets SubtractPatches classify every facet against ALL
   // stolen patches at once, matching how the main containment path
   // already batches shared_per_daughter + flush together.
-  std::unordered_map<int, std::vector<TopoDS_Shape>> pending_steals;
-
+  //
+  // Passed in explicitly (rather than captured) because the mother-group
+  // loop below now runs whole groups concurrently (one per thread) --
+  // each group needs its OWN accumulator, not one shared across groups.
   auto steal_for = [&](const VolumeInstance &D, const VolumeInstance &M,
                        const TopoDS_Shape &flush, double pair_fuzzy,
+                       std::unordered_map<int, std::vector<TopoDS_Shape>> &pending_steals,
                        uint64_t skip_emit_for_id = VolumeInstance::kNoMother) {
     auto it = interfaces_of_volume.find(M.id);
     if (it == interfaces_of_volume.end())
@@ -1121,40 +1135,89 @@ void InterfaceExtractor::Extract(
   // steal from interfaces created one level up.
   // --------------------------------------------------------
 
+  // depth of each mother_id in the BFS tree, kNoMother (the root) at 0.
+  // A plain FIFO-queue BFS enqueues every depth-D node before any
+  // depth-(D+1) node, so `ordered_mothers` comes out with depths in
+  // non-decreasing, contiguous blocks -- exploited below to run whole
+  // depth levels in parallel while still processing shallower levels
+  // (whose emitted interfaces deeper groups may need to steal from)
+  // strictly before deeper ones.
   std::vector<uint64_t> ordered_mothers;
+  std::unordered_map<uint64_t, int> depth_of;
   {
     std::vector<uint64_t> q;
-    if (children_of.count(VolumeInstance::kNoMother))
+    if (children_of.count(VolumeInstance::kNoMother)) {
       q.push_back(VolumeInstance::kNoMother);
+      depth_of[VolumeInstance::kNoMother] = 0;
+    }
 
     for (size_t h = 0; h < q.size(); ++h) {
       uint64_t m = q[h];
       ordered_mothers.push_back(m);
+      int d = depth_of[m];
       auto cit = children_of.find(m);
       if (cit == children_of.end())
         continue;
       for (size_t di : cit->second) {
         uint64_t cid = volumes[di].id;
-        if (children_of.count(cid))
+        if (children_of.count(cid) && !depth_of.count(cid)) {
+          depth_of[cid] = d + 1;
           q.push_back(cid);
+        }
       }
     }
     // defensive: append any group not reached from the root (tree should
-    // reach all; this only guards against a detached hierarchy)
+    // reach all; this only guards against a detached hierarchy). True
+    // depth is unknowable here, so bucket them all one level past
+    // everything real -- keeps the "non-decreasing depth" invariant the
+    // level-parallel loop below relies on, at the cost of running this
+    // (should-never-happen) leftover as its own final level.
+    int stray_depth = ordered_mothers.empty() ? 0 : depth_of[ordered_mothers.back()] + 1;
     for (const auto &g : children_of) {
-      bool seen = false;
-      for (uint64_t m : ordered_mothers)
-        if (m == g.first) {
-          seen = true;
-          break;
-        }
-      if (!seen)
+      if (!depth_of.count(g.first)) {
+        depth_of[g.first] = stray_depth;
         ordered_mothers.push_back(g.first);
+      }
     }
   }
 
-  for (uint64_t mother_id : ordered_mothers) {
+  // --------------------------------------------------------
+  // The mother-group loop is now parallelized ACROSS groups, one whole
+  // group per thread, instead of only within each group's own sibling/
+  // daughter loops. Confirmed via live profiling that with thousands of
+  // fiber-layer groups having exactly one daughter each, the per-group
+  // inner `#pragma omp parallel for` regions never had enough work to
+  // engage more than ~1-1.5 cores in practice (measured 101-149% CPU
+  // on a 10-core machine on the full fiber run) -- the real available
+  // parallelism is ACROSS all those small independent groups, not
+  // within any single one of them.
+  //
+  // Groups are only safe to run concurrently with groups at the SAME
+  // BFS depth: a group's daughters-loop can steal from (read) its own
+  // mother's already-emitted interfaces, which are only guaranteed to
+  // exist once every shallower-depth group has fully finished. Depths
+  // are non-decreasing and contiguous in `ordered_mothers` (see the BFS
+  // construction above), so slicing it into depth-runs and putting an
+  // implicit OpenMP barrier (the end of each `parallel for` region)
+  // between them preserves that ordering exactly, while still letting
+  // every group AT a given depth run concurrently with each other.
+  // --------------------------------------------------------
+
+  for (size_t level_begin = 0; level_begin < ordered_mothers.size();) {
+    size_t level_end = level_begin;
+    int level_depth = depth_of[ordered_mothers[level_begin]];
+    while (level_end < ordered_mothers.size() &&
+          depth_of[ordered_mothers[level_end]] == level_depth)
+      ++level_end;
+
+#pragma omp parallel for schedule(dynamic)
+  for (size_t group_pos = level_begin; group_pos < level_end; ++group_pos) {
+    uint64_t mother_id = ordered_mothers[group_pos];
     const std::vector<size_t> &daughters = children_of.find(mother_id)->second;
+
+    // Each concurrently-running group needs its own accumulator --
+    // see the note on steal_for's pending_steals parameter above.
+    std::unordered_map<int, std::vector<TopoDS_Shape>> pending_steals;
 
     // ====================================================
     // (1) sibling ↔ sibling: shared coincident faces
@@ -1454,7 +1517,7 @@ void InterfaceExtractor::Extract(
         uint64_t skip_id = iface_mother ? iface_mother->id
                                          : VolumeInstance::kNoMother;
 #pragma omp critical(iface_extract)
-        steal_for(daughter, mother, flush, flush_fuzzy, skip_id);
+        steal_for(daughter, mother, flush, flush_fuzzy, pending_steals, skip_id);
       }
 
       if (!iface_mother)
@@ -1499,13 +1562,21 @@ void InterfaceExtractor::Extract(
       // patches to cut out of the D↔iface_mother boundary (no double
       // coverage): regions shared with touching siblings.
       //
-      // shared_per_daughter is read-only from here on — phase (1)
-      // above has already fully completed (parallel for's implicit
-      // barrier), so no lock needed for this lookup.
+      // shared_per_daughter is only ever written for THIS group's own
+      // daughters (by phase (1) above, already complete by this point
+      // in program order for this thread), so no other group can be
+      // concurrently writing the SAME key -- but with groups now
+      // running concurrently (see the level-parallel loop above),
+      // another group's own phase (1) may still be live at this exact
+      // moment, so the underlying unordered_map itself (shared across
+      // all groups) still needs the same lock its writers use.
       std::vector<TopoDS_Shape> patches;
-      auto pit = shared_per_daughter.find(daughter.id);
-      if (pit != shared_per_daughter.end())
-        patches = pit->second;
+#pragma omp critical(iface_extract)
+      {
+        auto pit = shared_per_daughter.find(daughter.id);
+        if (pit != shared_per_daughter.end())
+          patches = pit->second;
+      }
 
       // The flush footprint (D's overlap with M's OUTER wall) only
       // belongs to someone else's interface -- and so only needs
@@ -1549,20 +1620,39 @@ void InterfaceExtractor::Extract(
     // instead of the sequential per-daughter cuts steal_for used to do.
     // Runs after the daughters loop above so every steal_for call this
     // iteration has already contributed before any interface is cut.
+    //
+    // The read and write of assembly.interfaces[idx] are each wrapped
+    // separately (SubtractPatches itself runs lock-free in between):
+    // with groups now running concurrently, some OTHER group may be
+    // mid-emit() (which can reallocate the shared assembly.interfaces
+    // vector) at the same moment -- idx values themselves never
+    // collide across groups (each interface is only ever stolen from
+    // by daughters of its own two endpoints' groups), but the raw
+    // indexed read/write still needs to serialize against a concurrent
+    // reallocation.
     for (auto &kv : pending_steals) {
       int idx = kv.first;
-      TopoDS_Shape I_boundary = assembly.interfaces[idx].boundary;
+      TopoDS_Shape I_boundary;
+#pragma omp critical(iface_extract)
+      I_boundary = assembly.interfaces[idx].boundary;
+
       bool warned = false;
       TopoDS_Shape shrunk = SubtractPatches(I_boundary, kv.second, fuzzy_mm,
                                             kAreaFloor, idx, warned);
-      assembly.interfaces[idx].boundary = shrunk;
-      if (!HasRealSurface(shrunk, kAreaFloor))
-        std::cout << "  [INFO] interface " << idx
-                  << " fully re-attributed to daughter(s) of mother_id="
-                  << mother_id << "\n";
+
+#pragma omp critical(iface_extract)
+      {
+        assembly.interfaces[idx].boundary = shrunk;
+        if (!HasRealSurface(shrunk, kAreaFloor))
+          std::cout << "  [INFO] interface " << idx
+                    << " fully re-attributed to daughter(s) of mother_id="
+                    << mother_id << "\n";
+      }
     }
-    pending_steals.clear();
   }
+
+    level_begin = level_end;
+  } // end level-parallel loop
 
   // --------------------------------------------------------
   // deterministic ordering: sibling pairs and daughters above are
