@@ -8,6 +8,7 @@
 
 #include <BRepBndLib.hxx>
 #include <Bnd_Box.hxx>
+#include <Bnd_OBB.hxx>
 
 #include <BRepClass3d.hxx>
 #include <BRepTools.hxx>
@@ -50,6 +51,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -94,6 +96,35 @@ static bool HasRealSurface(const TopoDS_Shape &s, double area_floor_mm2) {
 // fall back).
 // ============================================================
 
+// BRepClass3d_SolidClassifier::Load() explores and spatially indexes the
+// ENTIRE target shape -- for a fiber-layer interface, `classifyAgainst`
+// is almost always "lar" (thousands of tessellated faces), and this got
+// rebuilt from scratch on every single call. Confirmed via live `sample`
+// profiling (once fiber-layer sibling discovery was templated away, this
+// became the next dominant cost: OrientInterfaceClassifier ->
+// NormalPointsInto -> BRepClass3d_SolidClassifier). Cache the loaded
+// classifier per distinct target shape instead, so the same "lar" (or
+// any other repeated target) is indexed once, not once per interface.
+// thread_local because BRepClass3d_SolidClassifier is not safe to share
+// across threads calling Perform() concurrently -- each thread builds
+// its own copy of whichever few target shapes it happens to classify
+// against, which is still a tiny number compared to the interface count.
+static BRepClass3d_SolidClassifier &
+CachedClassifierFor(const TopoDS_Shape &target) {
+  thread_local std::unordered_map<const void *, BRepClass3d_SolidClassifier>
+      tlCache;
+  const void *key = target.TShape().get();
+  auto it = tlCache.find(key);
+  if (it != tlCache.end())
+    return it->second;
+  // operator[] default-constructs the value IN PLACE inside the map --
+  // BRepClass3d_SolidClassifier has no copy/move constructor, so
+  // emplace()-ing an already-built temporary into the map won't compile.
+  BRepClass3d_SolidClassifier &clf = tlCache[key];
+  clf.Load(target);
+  return clf;
+}
+
 static bool NormalPointsInto(const TopoDS_Shape &boundary,
                              const TopoDS_Shape &classifyAgainst, bool &ok) {
   ok = false;
@@ -129,8 +160,7 @@ static bool NormalPointsInto(const TopoDS_Shape &boundary,
   constexpr double eps = 1e-4; // 0.1 µm in mm
   gp_Pnt test(pt.X() + eps * n.X(), pt.Y() + eps * n.Y(), pt.Z() + eps * n.Z());
 
-  BRepClass3d_SolidClassifier clf;
-  clf.Load(classifyAgainst);
+  BRepClass3d_SolidClassifier &clf = CachedClassifierFor(classifyAgainst);
   clf.Perform(test, 1e-7);
 
   ok = true;
@@ -388,6 +418,102 @@ static bool FacesMayTouch(const TopoDS_Face &fa, const TopoDS_Face &fb,
   return !sampled_any; // no vertices found (shouldn't happen) -> don't
                        // risk a false negative, fall through to the
                        // real check instead of skipping blind
+}
+
+// ============================================================
+// Fiber-layer sibling templating.
+//
+// A fiber system can place thousands of individually-tiny volumes
+// sharing the exact same cross-section (only length/position/rotation
+// differ -- e.g. legend-200's att3 GDML variant: ~4000 straight box
+// segments, 3 fixed cross-sections for core/cl1/cl2). When such a
+// fiber layer touches a large uniform sibling (almost always the
+// surrounding LAr bulk), the contact is its own ENTIRE lateral surface
+// every single time -- there is no reason to re-run the expensive
+// per-instance FindSharedFacesCached discovery (confirmed via live
+// `sample` profiling: BOPAlgo_PaveFiller/BRepAlgoAPI_Common dominated
+// runtime here) for every one of thousands of geometrically-equivalent
+// instances.
+//
+// Strategy: the FIRST instance of a given (cross-section, material
+// pair) signature still pays for the real discovery, and its result
+// area is compared against that instance's own lateral surface area.
+// If they match closely (confirming "this cross-section's contact
+// really is its whole lateral surface, not some partial/edge case"),
+// every LATER instance sharing that signature skips the discovery
+// entirely and uses its own lateral surface directly (O(1) face
+// classification instead of an O(faces^2) boolean search). A signature
+// that doesn't confirm full coverage on its first instance is marked
+// unsafe and every instance keeps using full discovery, so this only
+// ever short-circuits cases proven equivalent to the true answer --
+// note this is a single validation, not per-instance, so an
+// unusually-placed LATER instance of an otherwise-safe signature
+// (e.g. one bend segment poking through LAr's own outer boundary)
+// would not be independently caught.
+// ============================================================
+
+struct FiberTemplateEntry {
+  bool safe = false;
+  double lateral_area_mm2 = 0.0;
+};
+
+bool IsFiberLayerMaterial(const std::string &mat) {
+  return mat == "tpb_on_fibers" || mat == "pmma_cl2" || mat == "pmma" ||
+         mat == "ps_fibers";
+}
+
+// Cross-section signature: the TWO SMALLER oriented-bounding-box half
+// extents (rotation- and length-invariant), plus the material pair.
+// Deliberately excludes the largest extent (the fiber's own length,
+// which varies freely between instances of the same underlying type)
+// and the OBB's orientation (which varies with each instance's own
+// placement rotation).
+static std::string FiberCrossSectionSignature(const TopoDS_Shape &shape,
+                                              const std::string &matA,
+                                              const std::string &matB) {
+  Bnd_OBB obb;
+  BRepBndLib::AddOBB(shape, obb, Standard_True);
+  double e[3] = {obb.XHSize(), obb.YHSize(), obb.ZHSize()};
+  std::sort(e, e + 3); // e[0] <= e[1] <= e[2] ("length" is e[2])
+  std::string a = matA, b = matB;
+  if (b < a)
+    std::swap(a, b);
+  std::ostringstream oss;
+  oss << std::fixed << std::setprecision(3) << e[0] << "," << e[1] << "|" << a
+      << "|" << b;
+  return oss.str();
+}
+
+// Every face of `shape` whose planar normal is roughly PERPENDICULAR to
+// the shape's own long (OBB) axis -- i.e. every face except the (up to
+// two) end caps. Non-planar faces are kept as-is (can't classify them,
+// and this is only ever used after confirming near-total area coverage
+// on a real computation, so including an extra curved face never makes
+// the result wrong, only possibly slightly more inclusive).
+static TopoDS_Shape LateralSurface(const TopoDS_Shape &shape,
+                                   const std::vector<TopoDS_Face> &faces) {
+  Bnd_OBB obb;
+  BRepBndLib::AddOBB(shape, obb, Standard_True);
+  gp_Dir longAxis(obb.XHSize() >= obb.YHSize() && obb.XHSize() >= obb.ZHSize()
+                      ? obb.XDirection()
+                  : obb.YHSize() >= obb.ZHSize() ? obb.YDirection()
+                                                  : obb.ZDirection());
+  BRep_Builder builder;
+  TopoDS_Compound out;
+  builder.MakeCompound(out);
+  for (const TopoDS_Face &f : faces) {
+    Handle(Geom_Surface) surf = BRep_Tool::Surface(f);
+    Handle(Geom_Plane) pl = Handle(Geom_Plane)::DownCast(surf);
+    if (pl.IsNull()) {
+      builder.Add(out, f); // not flat -- can't classify, keep it
+      continue;
+    }
+    double dot = std::abs(pl->Pln().Axis().Direction().Dot(longAxis));
+    if (dot < 0.9) // normal roughly PERPENDICULAR to the long axis -> lateral
+      builder.Add(out, f);
+    // else: end-cap face (normal roughly PARALLEL to long axis) -- excluded
+  }
+  return out;
 }
 
 // ============================================================
@@ -850,6 +976,13 @@ void InterfaceExtractor::Extract(
     }
   }
 
+  // Fiber-layer sibling templating cache (see FiberCrossSectionSignature/
+  // LateralSurface above), persists across every mother group so a fiber
+  // type seen under one parent volume also benefits any other instances
+  // of it elsewhere. Guarded by critical(fiber_template) below.
+  std::unordered_map<std::string, FiberTemplateEntry> fiber_template_cache;
+  int fiber_templated_count = 0, fiber_full_count = 0;
+
   // shared sibling patches accumulated per daughter VOLUME id, to be
   // cut out of the corresponding mother↔daughter boundaries
   std::unordered_map<uint64_t, std::vector<TopoDS_Shape>> shared_per_daughter;
@@ -1148,10 +1281,73 @@ void InterfaceExtractor::Extract(
 
       double pair_fuzzy = AdaptiveFuzzy(cache[daughters[a]].size,
                                         cache[daughters[b]].size, fuzzy_mm);
-      TopoDS_Shape shared = FindSharedFacesCached(
-          cache[daughters[a]].faces, cache[daughters[a]].faceBox,
-          cache[daughters[b]].faces, cache[daughters[b]].faceBox, pair_fuzzy,
-          kAreaFloor);
+
+      // Fiber-layer templating: exactly one side a fiber-layer material
+      // (the other typically bulk LAr) is the specific case profiled and
+      // confirmed expensive -- see the block comment above
+      // FiberCrossSectionSignature. Both-fiber or neither-fiber pairs
+      // always use the normal full discovery below.
+      bool aIsFiber = IsFiberLayerMaterial(A.material);
+      bool bIsFiber = IsFiberLayerMaterial(B.material);
+      TopoDS_Shape shared;
+      if (aIsFiber != bIsFiber) {
+        const VolumeInstance &fiberInst = aIsFiber ? A : B;
+        const VolumeInstance &otherInst = aIsFiber ? B : A;
+        size_t fiberIdx = aIsFiber ? daughters[a] : daughters[b];
+        std::string sig = FiberCrossSectionSignature(
+            fiberInst.shape, fiberInst.material, otherInst.material);
+
+        bool haveEntry = false;
+        FiberTemplateEntry entry;
+#pragma omp critical(fiber_template)
+        {
+          auto it = fiber_template_cache.find(sig);
+          if (it != fiber_template_cache.end()) {
+            entry = it->second;
+            haveEntry = true;
+          }
+        }
+
+        if (haveEntry && entry.safe) {
+          shared = LateralSurface(fiberInst.shape, cache[fiberIdx].faces);
+#pragma omp atomic
+          ++fiber_templated_count;
+        } else {
+          shared = FindSharedFacesCached(
+              cache[daughters[a]].faces, cache[daughters[a]].faceBox,
+              cache[daughters[b]].faces, cache[daughters[b]].faceBox,
+              pair_fuzzy, kAreaFloor);
+#pragma omp atomic
+          ++fiber_full_count;
+
+          if (!haveEntry) {
+            // first time seeing this signature -- validate it against
+            // this instance's own lateral surface before trusting it
+            // for any future instance.
+            TopoDS_Shape lateral =
+                LateralSurface(fiberInst.shape, cache[fiberIdx].faces);
+            GProp_GProps lp;
+            BRepGProp::SurfaceProperties(lateral, lp);
+            double lateral_area = lp.Mass();
+            double shared_area = 0.0;
+            if (HasRealSurface(shared, kAreaFloor)) {
+              GProp_GProps sp;
+              BRepGProp::SurfaceProperties(shared, sp);
+              shared_area = sp.Mass();
+            }
+            bool safe =
+                lateral_area > kAreaFloor && shared_area >= 0.98 * lateral_area;
+            FiberTemplateEntry newEntry{safe, lateral_area};
+#pragma omp critical(fiber_template)
+            fiber_template_cache.emplace(sig, newEntry);
+          }
+        }
+      } else {
+        shared = FindSharedFacesCached(
+            cache[daughters[a]].faces, cache[daughters[a]].faceBox,
+            cache[daughters[b]].faces, cache[daughters[b]].faceBox,
+            pair_fuzzy, kAreaFloor);
+      }
 
       if (!HasRealSurface(shared, kAreaFloor))
         continue;
@@ -1413,6 +1609,23 @@ void InterfaceExtractor::Extract(
 
   std::cout << "\nTotal interfaces found: " << assembly.interfaces.size()
             << std::endl;
+
+  if (fiber_templated_count > 0 || fiber_full_count > 0) {
+    std::cout << "Fiber-layer sibling templating: " << fiber_templated_count
+              << " instances reused a validated template, "
+              << fiber_full_count
+              << " ran the full discovery (first-of-signature + any unsafe "
+                 "signatures), across "
+              << fiber_template_cache.size() << " distinct cross-section "
+              << "signatures (" << [&] {
+                   int safe = 0;
+                   for (const auto &kv : fiber_template_cache)
+                     if (kv.second.safe)
+                       ++safe;
+                   return safe;
+                 }() << " confirmed safe)\n"
+              << std::endl;
+  }
 }
 
 // ============================================================
